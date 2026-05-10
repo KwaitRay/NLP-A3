@@ -57,24 +57,28 @@ def main() -> None:
 
     # Inspect one normal SFT record.
     one = next(r for r in normals if r["id"] == "c-1")
-    assert "Claim: Sea level is rising fast." in one["query"]
-    assert one["response"].startswith("SUPPORTS"), one["response"]
-    cited = one["response"]
-    assert "##[" in cited and "]##" in cited
-    print(f"  [pass] c-1 response = {cited!r}")
+    # New schema: messages = [system, user, assistant]
+    assert isinstance(one["messages"], list) and len(one["messages"]) == 3
+    assert [m["role"] for m in one["messages"]] == ["system", "user", "assistant"]
+    user_content = one["messages"][1]["content"]
+    assistant_content = one["messages"][2]["content"]
+    assert "Claim: Sea level is rising fast." in user_content
+    assert assistant_content.startswith("SUPPORTS"), assistant_content
+    assert "##[" in assistant_content and "]##" in assistant_content
+    print(f"  [pass] c-1 assistant content = {assistant_content!r}")
 
     # Hard-neg should always be NOT_ENOUGH_INFO.
     hns = [r for r in out if "augmented" in r["_meta"]]
     for hn in hns:
-        assert hn["response"].startswith("NOT_ENOUGH_INFO"), hn["response"]
+        assert hn["messages"][2]["content"].startswith("NOT_ENOUGH_INFO"), hn["messages"][2]["content"]
         assert hn["_meta"]["scenario"] == "nei_topic_off"
     print(f"  [pass] {len(hns)} hard negatives all NEI/topic_off")
 
     # Print one full record so a human can eyeball the prompt.
     print("\nSample record (c-1, gold path):")
-    print("  system:", one["system"][:80] + "...")
-    print("  query[:200]:", one["query"][:200].replace("\n", " | "))
-    print("  response:", one["response"])
+    print("  system:", one["messages"][0]["content"][:80] + "...")
+    print("  user[:200]:", user_content[:200].replace("\n", " | "))
+    print("  assistant:", assistant_content)
     print("  _meta:", one["_meta"])
 
 

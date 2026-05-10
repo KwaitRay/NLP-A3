@@ -1,7 +1,19 @@
 """Build SFT training jsonl in ms-swift format.
 
-ms-swift schema (per Plan §3.1):
-    {"system": "...", "query": "...", "response": "<chosen>"}
+ms-swift standard schema (the messages-list form; confirmed in
+materials/训练数据格式.docx §2.1 — this is the unambiguous official format,
+recommended over query-response which goes through AutoPreprocessor mapping):
+
+    {"messages": [
+        {"role": "system",    "content": "<SYSTEM_PROMPT>"},
+        {"role": "user",      "content": "<query>"},
+        {"role": "assistant", "content": "<chosen response>"},
+    ]}
+
+We additionally carry ``id`` and ``_meta`` fields per record for downstream
+processing (curriculum sort, DPO pair construction, ablation slicing).
+ms-swift ignores unknown top-level keys, so leaving ``id``/``_meta`` in the
+training file is harmless — `data_io.write_jsonl` does NOT strip them.
 
 Two construction modes:
   - ``gold_only`` (default): use the claim's gold evidences directly. Trains
@@ -133,9 +145,11 @@ def build_sft_record(
 
     return {
         "id": claim_id,
-        "system": SYSTEM_PROMPT,
-        "query": query,
-        "response": response,
+        "messages": [
+            {"role": "system",    "content": SYSTEM_PROMPT},
+            {"role": "user",      "content": query},
+            {"role": "assistant", "content": response},
+        ],
         "_meta": {
             "domain": tagged.get("domain"),
             "scenario": tagged.get("scenario"),
@@ -184,9 +198,11 @@ def build_hard_negative_record(
     response = build_target_response("NOT_ENOUGH_INFO", [], shown_ids)
     return {
         "id": f"{claim_id}__hn",
-        "system": SYSTEM_PROMPT,
-        "query": query,
-        "response": response,
+        "messages": [
+            {"role": "system",    "content": SYSTEM_PROMPT},
+            {"role": "user",      "content": query},
+            {"role": "assistant", "content": response},
+        ],
         "_meta": {
             "domain": tagged.get("domain"),
             "scenario": "nei_topic_off",  # synthetic: by construction off-topic

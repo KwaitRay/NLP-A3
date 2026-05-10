@@ -1,8 +1,17 @@
 """Stage 4 — DPO preference-pair construction.
 
 Mines wrong predictions on ``dev_holdout`` (NEVER on official dev) and emits
-ms-swift DPO format records, where ``response`` is the gold output (chosen)
-and ``rejected_response`` is the model's mispredicted output.
+ms-swift DPO format records.
+
+Output schema (matches the messages-list standard from
+materials/训练数据格式.docx §3.3 — DPO/ORPO/CPO/SimPO/RM):
+
+    {"messages": [
+        {"role": "system",    "content": "..."},
+        {"role": "user",      "content": "..."},
+        {"role": "assistant", "content": "<chosen response>"},
+     ],
+     "rejected_response": "<rejected response>"}
 
 Optionally augments with hand-crafted DISPUTED-vs-SUPPORTS contrast pairs:
 the most common confusion in 4-class climate-claim verification.
@@ -22,6 +31,21 @@ def _normalise_response(label: str, evidences: Iterable[str], shown_ids: list[st
     return build_target_response(label, list(evidences), shown_ids)
 
 
+def _messages_with_chosen(sft_record: dict, chosen_response: str) -> list[dict]:
+    """Clone the SFT record's [system, user] turns and replace the assistant.
+
+    SFT records are now in messages format: [{system}, {user}, {assistant}].
+    For DPO we keep the same system/user prompt and swap the assistant content
+    to the chosen (gold) response.
+    """
+    msgs = sft_record["messages"]
+    return [
+        {"role": "system",    "content": msgs[0]["content"]},
+        {"role": "user",      "content": msgs[1]["content"]},
+        {"role": "assistant", "content": chosen_response},
+    ]
+
+
 def build_dpo_pair(
     *,
     sft_record: dict,
@@ -33,7 +57,7 @@ def build_dpo_pair(
     """Build a single DPO record from one mispredicted dev_holdout example.
 
     Returns None when prediction matches gold (no preference signal).
-    The ``sft_record`` is the row we passed to the model — its ``query`` and
+    The ``sft_record`` is the row we passed to the model — its messages and
     ``_meta.shown`` carry the exact evidences the model saw, so the reference
     response can be reconstructed identically.
     """
@@ -46,9 +70,7 @@ def build_dpo_pair(
         return None
     return {
         "id": sft_record["id"],
-        "system": sft_record.get("system", SYSTEM_PROMPT),
-        "query": sft_record["query"],
-        "response": chosen,
+        "messages": _messages_with_chosen(sft_record, chosen),
         "rejected_response": rejected,
         "_meta": {
             **sft_record.get("_meta", {}),
@@ -121,15 +143,14 @@ def synthesise_disputed_contrast(
         shown_ids = rec.get("_meta", {}).get("shown") or []
         if not shown_ids:
             continue
-        chosen = rec["response"]  # Already SUPPORTS ##[..]##
+        # rec["messages"][2] is the assistant turn (already SUPPORTS ##[..]##).
+        chosen = rec["messages"][2]["content"]
         rejected = _normalise_response("DISPUTED", shown_ids[:1], shown_ids)
         if chosen == rejected:
             continue
         out.append({
             "id": f"{rec['id']}__synth_disputed",
-            "system": rec.get("system", SYSTEM_PROMPT),
-            "query": rec["query"],
-            "response": chosen,
+            "messages": _messages_with_chosen(rec, chosen),
             "rejected_response": rejected,
             "_meta": {**rec.get("_meta", {}), "augmented": "supports_vs_disputed"},
         })
@@ -144,8 +165,8 @@ def write_dpo_jsonl(records: list[dict], path: str | Path) -> int:
     n = 0
     with open(p, "w", encoding="utf-8") as f:
         for r in records:
-            # Strip ``_meta`` for the actual training file — ms-swift only
-            # consumes system/query/response/rejected_response.
+            # Strip ``id`` and ``_meta`` for the actual training file — ms-swift
+            # only consumes ``messages`` + ``rejected_response`` for DPO.
             payload = {k: v for k, v in r.items() if not k.startswith("_") and k != "id"}
             f.write(json.dumps(payload, ensure_ascii=False))
             f.write("\n")

@@ -14,9 +14,11 @@ from src.dpo_pairs import (  # noqa: E402
 
 SFT_REC_TPL = {
     "id": "claim-X",
-    "system": "sys",
-    "query": "Claim: ...\nEvidence:\n[1] e1\n[2] e2\nAnswer:",
-    "response": "SUPPORTS ##[1,2]##",
+    "messages": [
+        {"role": "system",    "content": "sys"},
+        {"role": "user",      "content": "Claim: ...\nEvidence:\n[1] e1\n[2] e2\nAnswer:"},
+        {"role": "assistant", "content": "SUPPORTS ##[1,2]##"},
+    ],
     "_meta": {"shown": ["ev-1", "ev-2"], "scenario": "supports_clear"},
 }
 
@@ -38,7 +40,8 @@ def test_build_pair_emits_when_label_wrong() -> None:
         gold_label="SUPPORTS", gold_evidences=["ev-1", "ev-2"],
     )
     assert pair is not None
-    assert pair["response"].startswith("SUPPORTS")
+    # Chosen lives at messages[2] (assistant turn); rejected_response is top-level.
+    assert pair["messages"][2]["content"].startswith("SUPPORTS")
     assert pair["rejected_response"].startswith("REFUTES")
     assert pair["_meta"]["pred_label"] == "REFUTES"
     print("  [pass] pair emitted on label mismatch")
