@@ -18,6 +18,7 @@ outputs/sft-out/
 outputs/dpo-out/
 outputs/predictions/
 outputs/smoke/
+models/                    # third-party weights (download via scripts.download_models)
 *.safetensors
 *.bin
 *.pt

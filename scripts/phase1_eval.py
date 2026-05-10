@@ -251,11 +251,21 @@ def load_model_and_tokenizer(model_dir: str | None):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
     if model_dir is None:
-        from modelscope import snapshot_download
-        model_dir = snapshot_download(
-            "Qwen/Qwen3.5-4B",
-            cache_dir=str(OUTPUTS_DIR / "model_cache"),
-        )
+        # 1. Prefer pre-downloaded local copy under models/Qwen3.5-4B/
+        #    (via scripts.download_models)
+        from src.paths import MODELS_DIR
+        local = MODELS_DIR / "Qwen3.5-4B"
+        if (local / "config.json").exists():
+            model_dir = str(local)
+            print(f"  [cache] using {model_dir}")
+        else:
+            # 2. Fall back to ModelScope download into outputs/model_cache/
+            from modelscope import snapshot_download
+            print("  models/Qwen3.5-4B/ not found — downloading via ModelScope...")
+            model_dir = snapshot_download(
+                "Qwen/Qwen3.5-4B",
+                cache_dir=str(OUTPUTS_DIR / "model_cache"),
+            )
     compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     print(f"  loading {model_dir} (dtype={compute_dtype}, 4-bit)...")
     bnb_cfg = BitsAndBytesConfig(

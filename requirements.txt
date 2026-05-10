@@ -16,16 +16,20 @@
 #   pip install -U "flash-linear-attention>=0.4.2" --no-build-isolation
 #   pip install -U "git+https://github.com/Dao-AILab/causal-conv1d" --no-build-isolation
 #
-#   # 4. Smoke test —— 5 分钟验证模型/推理路径/SC 行为
-#   python -m scripts.test_qwen35_inference \
-#       --model-dir outputs/model_cache/Qwen/Qwen3___5-4B
+#   # 4. 一次性下载所有模型权重到 models/ (~11 GB)
+#   #    Qwen3.5-4B (8GB) + bge-m3 (2GB) + bge-reranker-base (1GB) + bge-small (130MB)
+#   python -m scripts.download_models
+#   #    选择性下载: --only qwen / --skip qwen / --only bge-m3,bge-reranker-base
 #
-#   # 5. 建检索索引（一次性 ~30-45 min）
+#   # 5. Smoke test —— 5 分钟验证模型/推理路径/SC 行为（自动用 models/ 里的本地副本）
+#   python -m scripts.test_qwen35_inference
+#
+#   # 6. 建检索索引（一次性 ~30-45 min）
 #   python -m scripts.build_indexes
 #
-#   # 6. Phase 1 评估 —— Track 1/2 × prompt 变体扫描（~15 min）
+#   # 7. Phase 1 评估 —— Track 1/2 × prompt 变体扫描（~15 min）
 #   python -m scripts.phase1_eval --tracks 1,2 --prompts v1,v2,v3,v4 \
-#       --dataset diag_test --model-dir outputs/model_cache/Qwen/Qwen3___5-4B
+#       --dataset diag_test
 #   # 输出在 outputs/eval_phase1/，看 summary_diag_test.md
 #
 # ────────────────────────────────────────────────────────────────────────────

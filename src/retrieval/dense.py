@@ -41,10 +41,14 @@ class DenseRetriever:
     def _load_model(self):
         if self._model is None:
             from sentence_transformers import SentenceTransformer
+            from ..paths import resolve_model_path
             # Note: bge-m3 ships only pytorch_model.bin (no safetensors). Loading
             # via torch.load() requires either torch>=2.6 OR transformers<4.50;
             # see environment_setting.md Q8 / requirements.txt pin.
-            self._model = SentenceTransformer(self.model_name, device=self.device)
+            # resolve_model_path() returns models/<basename>/ if pre-downloaded
+            # via scripts.download_models, else the original HF repo_id.
+            path = resolve_model_path(self.model_name)
+            self._model = SentenceTransformer(path, device=self.device)
             self._model.max_seq_length = self.max_seq_length
             if self.fp16 and self.device.startswith("cuda"):
                 self._model.half()

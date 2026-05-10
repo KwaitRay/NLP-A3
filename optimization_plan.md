@@ -45,7 +45,7 @@ Track 2 (RAG), so all later improvements have a comparison anchor.
 
 | 资源 / Resource | 路径 / Path | 缺失则跑 / If missing, run |
 |---|---|---|
-| Qwen3.5-4B 权重 / model weights | `outputs/model_cache/Qwen/Qwen3___5-4B/` | `python -m scripts.test_qwen35_inference`（自动下载 / auto-downloads） |
+| **所有模型权重 / all model weights** | `models/{Qwen3.5-4B,bge-m3,bge-reranker-base,bge-small-en-v1.5}/` | `python -m scripts.download_models`（一次性 ~11 GB / one-time） |
 | BM25 索引 / index | `outputs/bm25_index/` | `python -m scripts.build_indexes --skip-dense` |
 | Dense 索引 / index | `outputs/dense_index/faiss.index` | `python -m scripts.build_indexes` |
 | `diag_test.jsonl` | `outputs/splits/diag_test.jsonl` | notebook cell 1.3 (run_splits) 或 / or `python -m scripts.dry_run` |
@@ -297,7 +297,7 @@ else:
 | **SFT 训练数据 / SFT data** | `outputs/sft_data/sft_{train,dev_holdout,diag_test}_v1.jsonl` | ~5 MB | `src.sft_dataset.build_dataset()` | **cell 1.4 已升级 / upgraded ✓** |
 | BM25 索引 / index | `outputs/bm25_index/` | ~200 MB | `BM25Retriever.build()` | cell 2.1 ✓ |
 | Dense 索引 / index | `outputs/dense_index/{faiss.index,chunks/}` | ~5 GB | `DenseRetriever.build()` | cell 2.2 ✓（带 faiss.index 二次校验） |
-| 模型权重 / model weights | `outputs/model_cache/Qwen/Qwen3___5-4B/` | ~8 GB | `modelscope.snapshot_download()` | 自动 / auto |
+| **模型权重（统一）/ all model weights** | `models/{Qwen3.5-4B,bge-m3,bge-reranker-base,bge-small-en-v1.5}/` | ~11 GB total | `scripts.download_models` | `paths.resolve_model_path()` ✓ — DenseRetriever / CrossEncoderReranker / phase1_eval / smoke_test 全部自动检测 |
 | SFT checkpoint | `outputs/sft-out/checkpoint-*/` | ~100-500 MB | ms-swift sft | cell 3.5b: `if SFT_CKPT.exists()` ✓ |
 | DPO checkpoint | `outputs/dpo-out/checkpoint-*/` | ~100-500 MB | ms-swift rlhf | cell 3.5b: `if DPO_CKPT.exists()` ✓ |
 | 推理预测 / predictions | `outputs/predictions/track*.json` | < 1 MB | `evaluate_track()` | (覆盖式 / overwritten each run) |

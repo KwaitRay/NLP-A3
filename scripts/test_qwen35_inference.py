@@ -95,12 +95,19 @@ def load_model(model_dir: str | None, quantize: bool):
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
     if model_dir is None:
-        from modelscope import snapshot_download
-        print("  downloading from ModelScope...")
-        model_dir = snapshot_download(
-            "Qwen/Qwen3.5-4B",
-            cache_dir=str(Path(__file__).resolve().parent.parent / "outputs" / "model_cache"),
-        )
+        # Prefer pre-downloaded local copy under models/Qwen3.5-4B/
+        repo_root = Path(__file__).resolve().parent.parent
+        local = repo_root / "models" / "Qwen3.5-4B"
+        if (local / "config.json").exists():
+            model_dir = str(local)
+            print(f"  using local copy: {model_dir}")
+        else:
+            from modelscope import snapshot_download
+            print("  models/Qwen3.5-4B/ not found — downloading from ModelScope...")
+            model_dir = snapshot_download(
+                "Qwen/Qwen3.5-4B",
+                cache_dir=str(repo_root / "outputs" / "model_cache"),
+            )
     _kv("model dir", model_dir)
 
     compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16

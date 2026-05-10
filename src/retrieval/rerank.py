@@ -28,7 +28,10 @@ class CrossEncoderReranker:
     def _load(self):
         if self._model is None:
             from sentence_transformers import CrossEncoder
-            self._model = CrossEncoder(self.model_name, device=self.device, max_length=512)
+            from ..paths import resolve_model_path
+            # Prefer pre-downloaded local copy under models/<basename>/.
+            path = resolve_model_path(self.model_name)
+            self._model = CrossEncoder(path, device=self.device, max_length=512)
         return self._model
 
     def rerank(
