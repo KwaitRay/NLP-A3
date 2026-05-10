@@ -1,0 +1,397 @@
+# 优化计划 / Optimization Plan
+
+> **本文是 design.md D-015（评估驱动的迭代式 SFT 数据扩充）的可执行落地版**。
+> design.md 说"为什么这么做"；本文说"具体怎么一步步做"。
+>
+> **This document is the executable counterpart to design.md D-015** (eval-driven
+> iterative SFT data design). design.md states the *why*; this file states the
+> *what* and *when*, phase by phase.
+
+---
+
+## 0. 总览 / Overview
+
+```
+评估驱动的六阶段闭环 / Six-phase evaluation-driven loop:
+
+  Phase 1  Baseline 评估     ─→  Phase 2  Prompt 迭代
+  Baseline eval (Track 1+2)        Prompt iteration (v2-v4)
+                                          ↓
+  Phase 6  最终汇报          ←─  Phase 3  最优 Prompt + RAG 重测
+  Final report (eval.py)           Locked prompt re-eval
+       ↑                                  ↓
+  Phase 5  SFT/DPO 训练 + 评估  ←   Phase 4  弱桶定位 + SFT 数据扩充
+  Train + eval                       Weak-bucket → tilted SFT data
+```
+
+**核心原则 / Core principles**:
+1. **评估先行 / Eval first** — 在 SFT 之前先压榨 prompt 和 RAG 的能力（D-015）
+2. **缓存优先 / Cache first** — 所有重计算结果落 Drive / 本地，notebook 自动检测复用（§9）
+3. **后验驱动 / Posterior-driven data design** — SFT 数据配比由诊断切片表决定，不靠先验
+4. **不污染 dev / Never look at dev** — Phase 1-5 全部在 `diag_test`；只有 Phase 6 才碰 `official_dev`
+
+---
+
+## 1. Phase 1 — Baseline 评估 / Baseline Evaluation
+
+### 1.1 目的 / Purpose
+
+测量 **base 模型 + 当前 prompt（v1）** 在两条路径上的表现，作为后续所有改进的基线。
+
+Measure base model + current prompt (v1) baselines on Track 1 (no-RAG) and
+Track 2 (RAG), so all later improvements have a comparison anchor.
+
+### 1.2 前置条件 / Prerequisites
+
+| 资源 / Resource | 路径 / Path | 缺失则跑 / If missing, run |
+|---|---|---|
+| Qwen3.5-4B 权重 / model weights | `outputs/model_cache/Qwen/Qwen3___5-4B/` | `python -m scripts.test_qwen35_inference`（自动下载 / auto-downloads） |
+| BM25 索引 / index | `outputs/bm25_index/` | `python -m scripts.build_indexes --skip-dense` |
+| Dense 索引 / index | `outputs/dense_index/faiss.index` | `python -m scripts.build_indexes` |
+| `diag_test.jsonl` | `outputs/splits/diag_test.jsonl` | notebook cell 1.3 (run_splits) 或 / or `python -m scripts.dry_run` |
+
+### 1.3 执行 / Execute
+
+```bash
+# AutoDL（4080 SUPER, ~10 分钟 / minutes）
+python -m scripts.phase1_eval \
+    --tracks 1,2 --prompts v1 --dataset diag_test \
+    --model-dir outputs/model_cache/Qwen/Qwen3___5-4B
+```
+
+### 1.4 产出 / Outputs
+
+- `outputs/eval_phase1/track1_v1_diag_test.{json,md}`
+- `outputs/eval_phase1/track2_v1_diag_test.{json,md}`
+- `outputs/eval_phase1/summary_diag_test.md`
+
+### 1.5 看什么 / What to read
+
+打开 `track2_v1_diag_test.md`，per-bucket 表已按 HM 升序——**最差的桶在最上面**，那就是 Phase 4 要瞄准的目标。
+
+Open `track2_v1_diag_test.md`; per-bucket tables are sorted by HM ascending,
+so worst buckets surface at top — those are the Phase 4 targets.
+
+### 1.6 决策点 / Decision criteria
+
+| 现象 / Observation | 含义 / Meaning | 行动 / Action |
+|---|---|---|
+| Track 1 acc < 0.25 | 模型/parser 失效 / model or parser broken | 回 smoke test 排查 |
+| Track 2 F < 0.05 | RAG 检索没接通 / retrieval not wired | 回 cell 2.3 检查 `pipeline.retrieve` |
+| Track 2 acc > Track 1 acc + 0.10 | RAG 显著提升 / RAG helps a lot | 进 Phase 2 |
+| Track 2 acc < Track 1 acc | RAG 上下文挤注意力 / RAG distracts | 仍进 Phase 2，看 prompt 能不能修 |
+
+---
+
+## 2. Phase 2 — Prompt 迭代 / Prompt Iteration
+
+### 2.1 目的 / Purpose
+
+把 **prompt 的能力压榨到极致**，看哪些"看似 SFT 才能修"的问题其实 prompt 就能修。
+**Push prompts to their limit** to identify problems that look like SFT-needed but are actually fixable by prompting.
+
+### 2.2 候选变体 / Candidates（已实现 in `src/prompt.py`）
+
+| 版本 / Version | 动机 / Motivation |
+|---|---|
+| **v1** baseline | 当前 production prompt / current production |
+| **v2** nei_explicit | 显式 NEI 触发条件（解决 base 把 NEI 错判 REFUTES） / explicit NEI trigger |
+| **v3** disputed_explicit | v2 + 显式 DISPUTED 触发条件（解决 sample 5"识别矛盾仍 SUPPORTS"） / explicit DISPUTED trigger |
+| **v4** few_shot | v3 + 4 shot 示范（每类 1 条）/ v3 + 4-shot demos |
+| ~~v5 chain-of-thought~~ | 推迟 / deferred — 需先改 `parse_response` 取最后匹配 |
+
+### 2.3 执行 / Execute
+
+```bash
+# 仅 Track 2，全部变体 / Track 2 only, all variants（~15 min on 4080）
+python -m scripts.phase1_eval \
+    --tracks 2 --prompts v2,v3,v4 --dataset diag_test \
+    --model-dir outputs/model_cache/Qwen/Qwen3___5-4B
+```
+
+### 2.4 决策 / Decision
+
+打开 `summary_diag_test.md`：
+- **取 Track 2 上 HM 最高的 prompt** 作为锁定版本
+- 如果 v4（few-shot）只比 v3 高 < 0.005，**优先选 v3**（context 短、推理快）
+- 把锁定版本写入 `optimization_plan.md` 的 §10 决策日志
+
+### 2.5 风险 / Risks
+
+| 风险 / Risk | 缓解 / Mitigation |
+|---|---|
+| Few-shot 把 prompt 撑长 → 显存/延迟 / few-shot bloats prompt | v4 实测 ~1500 字符 ≈ 400 tokens，可接受 |
+| 不同 prompt 在不同桶上各有所长 / different prompts win different buckets | 看 per-bucket 表，按"最弱桶提升幅度"加权而不是只看总 HM |
+| Prompt 锁定后 SFT 数据也得跟着用同一版本 / SFT data must use same prompt | `src/sft_dataset.py:build_user_query` 默认 v1，需改 default 或在 `build_dataset` 调用处显式传 version |
+
+---
+
+## 3. Phase 3 — 最优 Prompt + RAG 重测 / Locked-prompt Re-eval
+
+### 3.1 目的 / Purpose
+
+用锁定的 prompt 在 `diag_test` 上重新生成完整诊断切片，作为 Phase 4 的"靶子"。
+
+Re-evaluate with the locked prompt to produce the diagnostic slices that
+Phase 4 uses as targets.
+
+### 3.2 执行 / Execute
+
+如果 Phase 2 已经跑过最优 prompt 在 diag_test 上的 Track 2，**直接复用**那次的 `track2_<prompt>_diag_test.md`，**不必再跑**。
+
+If Phase 2 already produced track2_<best>_diag_test.md, **skip — reuse it**.
+
+### 3.3 把当前最优数字记下来 / Record the headline numbers
+
+在本文件的 §10（决策日志）记录：
+- 锁定 prompt 版本号
+- Track 2 整体 (F, Acc, HM)
+- 最弱的 3-5 个 bucket（domain × scenario × difficulty 任一维度）
+
+---
+
+## 4. Phase 4 — 弱桶定位 + SFT 数据扩充 / Weak-bucket Targeting
+
+### 4.1 目的 / Purpose
+
+把 SFT 训练样本从"按先验配比"改成"按后验弱点配比"——同样训练量，对最差桶提升最大。
+
+Tilt SFT sampler from heuristic-prior to data-driven posterior — same
+training budget, biggest lift on weakest buckets.
+
+### 4.2 弱桶判定标准 / Weak-bucket criteria
+
+按以下任一条件入选 / pick if any of:
+- HM < 0.30（绝对低）
+- HM < 整体 HM × 0.60（相对低）
+- n ≥ 5（样本数够，结论稳）
+
+### 4.3 数据扩充策略 / Augmentation strategy
+
+按弱桶类型分别处理 / Different tactics per bucket type:
+
+| 弱桶维度 / Bucket axis | 典型弱点 / Typical weakness | 扩充手段 / Augmentation tactic |
+|---|---|---|
+| **scenario** = `nei_topic_off` | base 把无关证据看成相关 / treats off-topic as relevant | 加大 `n_hard_neg` 配比（当前 1 → 3）；hard-neg 已经天然是 nei_topic_off |
+| **scenario** = `disputed_conflict` | 看到矛盾仍 SUPPORTS / labels SUPPORTS despite conflict | 在 DPO 阶段（Phase 5）合成 SUPPORTS-vs-DISPUTED 对抗对（已在 `dpo_pairs.synthesise_disputed_contrast`） |
+| **domain** = `general_other` (启发式覆盖率不足 / heuristic miss) | 训练分布外 / out-of-distribution at train time | 重新跑 §1.2 三维打标，用 sentence-transformer 聚类细化 `general_other` 子类（当前 519 / 1228 = 42% 兜底） |
+| **difficulty** = `hard` | 多证据需聚合 / aggregation required | 在 `build_sft_record` 里给 hard 样本设 `k=8`（看更多 evidence） |
+
+### 4.4 实施 / Implementation
+
+修改 `src/sft_dataset.py:build_dataset` 的 sampler：
+
+```python
+# 伪代码 / pseudocode
+def build_dataset(tagged_rows, evidence, *, weak_buckets=None, **kwargs):
+    """weak_buckets: dict like {('scenario', 'nei_topic_off'): 3, ...}
+    multiplier per matching record."""
+    out = []
+    for row in tagged_rows:
+        record = build_sft_record(row, evidence, ...)
+        n_copies = _bucket_multiplier(row, weak_buckets)  # default 1
+        for _ in range(n_copies):
+            out.append(record)
+        # hard-neg 同样按 weak_buckets 缩放
+```
+
+**实现工单 / Ticket**: 加 `weak_buckets` 参数到 `build_dataset`，新建 `outputs/sft_data/sft_train_v2.jsonl`，保留 v1 备份用于 ablation。
+
+### 4.5 产出 / Output
+
+- `outputs/sft_data/sft_train_v2.jsonl`（弱桶倾斜版 / weak-bucket-tilted）
+- `outputs/sft_data/sft_train_v2_meta.json`（记录用了哪些 weak_buckets 配比）
+
+---
+
+## 5. Phase 5 — SFT/DPO 训练 + 评估 / Train + Eval
+
+### 5.1 SFT 训练（v2 数据）/ SFT (v2 data)
+
+```bash
+# 修改 cell-2-sft-train 的 DATA_PATH 指向 sft_train_v2.jsonl
+python -m scripts.run_sft   # 或直接在 notebook 取消注释 !{cmd}
+```
+
+**显存预算**已在 design.md §8.4 列出。AutoDL 4080 SUPER 上 ~25-35 min。
+
+### 5.2 DPO 训练（dev_holdout 错样本 + DISPUTED 对抗对）/ DPO
+
+```bash
+python -m scripts.run_dpo  # 待实现 / TBD
+```
+
+### 5.3 评估同样的 prompt + 训练后的模型 / Re-eval
+
+```bash
+# 加 --sft-checkpoint / --dpo-checkpoint 参数到 phase1_eval（待实现）
+python -m scripts.phase1_eval \
+    --tracks 2,3,4 --prompts <locked> --dataset diag_test \
+    --model-dir outputs/model_cache/Qwen/Qwen3___5-4B \
+    --sft-adapter outputs/sft-out/checkpoint-final \
+    --dpo-adapter outputs/dpo-out/checkpoint-final
+```
+
+### 5.4 验证 / Validation
+
+对比 Phase 3 的 per-bucket 表 vs Phase 5 的 per-bucket 表：
+- **每个被瞄准的弱桶 HM 提升 ≥ +0.10** → 数据扩充策略生效
+- **未瞄准的桶 HM 不掉** → 没有"按下葫芦浮起瓢"
+- **总 HM 提升 ≥ +0.05** → 可以进 Phase 6
+
+如果 (1) 不达标，回 Phase 4 重新设计 weak_buckets 配比。
+
+Compare Phase 3 vs Phase 5 per-bucket tables; targeted buckets should
+each gain ≥ +0.10 HM, untargeted buckets shouldn't regress, total HM
+should gain ≥ +0.05. If targeted buckets don't improve, return to
+Phase 4 and rethink the augmentation tactic.
+
+---
+
+## 6. Phase 6 — 最终汇报 / Final Report
+
+### 6.1 在 official dev 上跑一次最终 4-track / Run 4-track on official dev once
+
+```bash
+# 这是消耗"看 dev"额度的最终一次 / consumes the "look at dev" budget
+python -m scripts.phase1_eval \
+    --tracks 1,2 --prompts <locked> --dataset official_dev ...
+# 加上 SFT/DPO track（Phase 5 拿到 checkpoint 后）
+```
+
+### 6.2 跑 test 集 / Run test set
+
+`notebook.ipynb` cell 3.4 (`cell-3-test-code`)：
+- 读 `data/test-claims-unlabelled.json`
+- 跑同一 pipeline → `outputs/test-claims-predictions.json`
+
+### 6.3 写报告 / Write report
+
+`design.md` §11.3 列出的 6-9 张图表；本 plan 的 §10 决策日志直接搬进报告 Discussion。
+
+---
+
+## 7. 持久化策略 / Persistence Strategy
+
+### 7.1 Cache-first 模式 / Cache-first pattern
+
+每个 cell / 脚本的统一模板 / Uniform template:
+
+```python
+if (CACHE_PATH / "<artifact>").exists():
+    obj = load_from_cache(CACHE_PATH)
+    print("[cache] loaded")
+else:
+    obj = expensive_build()
+    save_to_cache(obj, CACHE_PATH)
+    print(f"[wrote] {CACHE_PATH}")
+```
+
+### 7.2 Artifact 清单 / Artifact inventory
+
+| Artifact | 路径 / Path | 大小 / Size | 来源 / Source | Cache 检测点 / Cache detection |
+|---|---|---|---|---|
+| Evidence corpus | `data/evidence.json` | 174 MB | 课程提供 / provided | (no build) |
+| 三维打标 / 3-axis tags | `outputs/splits/claims_tagged.jsonl` | < 1 MB | `src.stage0_tag.run()` | cell 1.2 检测 |
+| Hash 切分 / splits | `outputs/splits/{train_split,dev_holdout,diag_test,official_dev}.jsonl` | < 1 MB | `src.splits.run()` | cell 1.3 |
+| **SFT 训练数据 / SFT data** | `outputs/sft_data/sft_{train,dev_holdout,diag_test}_v1.jsonl` | ~5 MB | `src.sft_dataset.build_dataset()` | **cell 1.4 已升级 / upgraded ✓** |
+| BM25 索引 / index | `outputs/bm25_index/` | ~200 MB | `BM25Retriever.build()` | cell 2.1 ✓ |
+| Dense 索引 / index | `outputs/dense_index/{faiss.index,chunks/}` | ~5 GB | `DenseRetriever.build()` | cell 2.2 ✓（带 faiss.index 二次校验） |
+| 模型权重 / model weights | `outputs/model_cache/Qwen/Qwen3___5-4B/` | ~8 GB | `modelscope.snapshot_download()` | 自动 / auto |
+| SFT checkpoint | `outputs/sft-out/checkpoint-*/` | ~100-500 MB | ms-swift sft | cell 3.5b: `if SFT_CKPT.exists()` ✓ |
+| DPO checkpoint | `outputs/dpo-out/checkpoint-*/` | ~100-500 MB | ms-swift rlhf | cell 3.5b: `if DPO_CKPT.exists()` ✓ |
+| 推理预测 / predictions | `outputs/predictions/track*.json` | < 1 MB | `evaluate_track()` | (覆盖式 / overwritten each run) |
+| 评估报告 / eval reports | `outputs/eval_phase1/*.{json,md}` | < 1 MB | `phase1_eval` | (覆盖式) |
+
+### 7.3 提交边界 / Submission boundary（per design.md §2.8）
+
+**禁止提交 / Cannot ship**：
+- `data/evidence.json`（174 MB）
+- `outputs/dense_index/`（5 GB）
+- `outputs/model_cache/`（8 GB）
+- `outputs/sft-out/`、`outputs/dpo-out/`（checkpoints）
+
+**可以提交 / Can ship**：
+- `notebooks/notebook.ipynb`（含已执行结果 / with cell outputs）
+- `src/`、`tests/`、`scripts/`
+- `design.md`、`debug_log.md`、`optimization_plan.md`、`requirements.txt`、`README.md`
+- `outputs/sft_data/*.jsonl`（小，演示数据格式 / small, shows format）
+- `outputs/eval_phase*/*.md`（评估报告 markdown / eval markdown reports）
+- `outputs/dry_run_report.md`、`outputs/PROGRESS.md`
+
+`.gitignore` 已经把大件全部排除，本地开发 / AutoDL 上保留完整 cache，提交 zip 时仅打包小件。
+
+`.gitignore` already excludes large artifacts; full cache lives on dev /
+AutoDL boxes; submission zip carries only small artifacts.
+
+### 7.4 跨机器 cache 复用 / Cross-machine cache reuse
+
+```bash
+# 本地建好 BM25 → 上传到 AutoDL（10 分钟 vs 重建 3 分钟，没必要 / not worth it）
+# 本地建好 Dense → 上传到 AutoDL（5 GB 上传慢，重建 15-20 分钟 / rebuild faster）
+
+# 真正值得跨机复用的是 model weights：
+# AutoDL 下好 → tar + scp 到本地（避免本地再下 8 GB）
+# 或本地用 modelscope 下好 → scp 到 AutoDL outputs/model_cache/
+```
+
+实测：dense 索引重建比 SCP 5GB 快，所以**每台机器各自建**就行。模型权重值得跨机复用。
+
+---
+
+## 8. 风险与回退 / Risks and Fallbacks
+
+| 风险 / Risk | 概率 / P | 缓解 / Mitigation |
+|---|---|---|
+| Phase 4 数据扩充后总 HM 反而下降 / total HM drops after Phase 4 | 中 / med | 保留 v1 数据；按 ablation 双数据集训两个 LoRA 对比 |
+| Few-shot prompt 在某些样本上 OOM / few-shot OOMs on some claims | 低 / low | `--max_length` 从 1024 → 1280 给 prompt 留余量 |
+| Phase 5 训练 8h 超时 / training timeout | 中 / med | `--save_steps 200` + `resume_from_checkpoint`（已配置 / configured） |
+| Phase 6 official_dev 数字比 diag_test 差很多 / official_dev underperforms | 中 / med | 说明 diag_test 不能完全代理 official_dev 分布；只在 final report 诚实说明 |
+| 部分弱桶 n < 5（统计噪声）/ small-n buckets are noisy | 高 / high | 弱桶判定加 `n >= 5` 门槛（§4.2 已规定） |
+
+---
+
+## 9. 当前状态 / Current Status (2026-05-11)
+
+### 已完成 / Done
+- [x] D-015 方法论决策固化到 design.md
+- [x] `src/prompt.py` 加 v1-v4 变体
+- [x] `src/inference.py` 加 `prompt_version` 参数
+- [x] `scripts/build_indexes.py`（独立索引构建）
+- [x] `scripts/phase1_eval.py`（Phase 1 评估 harness）
+- [x] cell-1-sft-code 升级为 cache-first（同时建三份数据）
+- [x] `requirements.txt` 加 AutoDL Quick Start
+- [x] AutoDL 4080 SUPER 实例 + 模型 + smoke test 通过
+
+### 进行中 / In progress
+- [ ] AutoDL 上 build BM25 + dense 索引
+- [ ] Phase 1 baseline 评估（v1 on diag_test）
+
+### 待做 / Todo
+- [ ] Phase 2 prompt 变体扫描（v2-v4 on diag_test）
+- [ ] Phase 3-4：弱桶定位 + 给 `build_dataset` 加 `weak_buckets` 参数
+- [ ] Phase 5：SFT v2 训练 + DPO 训练 + 4-track 评估
+- [ ] Phase 6：official dev 终评 + test 集预测 + 报告
+
+---
+
+## 10. 决策日志 / Decision Log
+
+每次 Phase 完成后在此追加一条 / Append after each phase completion.
+
+| Date | Phase | Decision | Source data |
+|---|---|---|---|
+| 2026-05-11 | (pre-Phase 1) | smoke test 显示 base 模型能输出 `LABEL ##[..]##` 干净格式，5/5 SC 同票 (SUPPORTS) 但 sample 5 同时引 ev-pro 和 ev-con → base 缺"识别证据矛盾"能力 | `materials/qwen3.5_key_points.docx` + AutoDL smoke test logs |
+| TBD | Phase 1 done | Track 1 (HM=?), Track 2 (HM=?), 最弱 3 桶: ?? | `outputs/eval_phase1/track2_v1_diag_test.md` |
+| TBD | Phase 2 done | 锁定 prompt: v?  Track 2 HM 提升 +? | `outputs/eval_phase1/summary_diag_test.md` |
+| TBD | Phase 4 done | weak_buckets 配比: {...} → sft_train_v2.jsonl | `outputs/sft_data/sft_train_v2_meta.json` |
+| TBD | Phase 5 done | SFT/DPO HM = ?, 最弱桶提升: ... | Phase 5 eval reports |
+| TBD | Phase 6 done | Official dev: F=?, Acc=?, HM=?  Test predictions: outputs/test-claims-predictions.json | eval.py output |
+
+---
+
+**关联文件 / Related files**:
+- `design.md` — 系统架构 + 决策记录 / system design + decision records
+- `debug_log.md` — 问题排查日志 / problem-solving log
+- `requirements.txt` — 依赖 + AutoDL Quick Start / deps + AutoDL onboarding
+- `scripts/{build_indexes,phase1_eval,test_qwen35_inference}.py` — 阶段执行脚本 / phase execution scripts
