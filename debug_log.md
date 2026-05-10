@@ -541,3 +541,428 @@ print("evidence:", "evidence" in dir(), len(evidence) if "evidence" in dir() els
 print("dense:", "dense" in dir())
 print("bm25:", "bm25" in dir())
 ```
+
+---
+
+# 会话 2 — 2026-05-10/11 — Qwen3.5 + AutoDL + messages 格式
+
+## 会话元信息
+
+- **日期**: 2026-05-10 / 2026-05-11
+- **环境**:
+  - Colab T4 (会话起点)
+  - **AutoDL Linux 实例 RTX 4080 SUPER 31.5 GB VRAM**（中段切换；驱动错配后重建为 PyTorch 2.5.1+cu124 镜像）
+- **范围**: SFT 训练管线打通；推理路径修复；数据格式向 ms-swift 标准 messages 迁移
+- **新增参考材料**: `materials/{swift_training,qwen3.5_key_points,训练数据格式}.docx`（来自 ms-swift 官方文档 + CSDN 实战帖）
+
+---
+
+## 问题时间线
+
+### 问题 9 — ms-swift CLI 参数名跨版本改动（连环 3 次）
+
+**现象**（依次出现）
+```
+ValueError: remaining_argv: ['--train_type', 'lora', '--quantization_bit', '4']
+ValueError: remaining_argv: ['--sft_type', 'lora']
+```
+
+**根因**
+
+Colab 上的 ms-swift 实际 CLI 路径是 `swift/pipelines/train/sft.py`（非常见的 `swift/llm/`），且警告"will be removed in v5.2"，属于 v3.6+ 过渡分支。该分支的参数名相对官方文档有改动：
+
+| 旧名（design.md / 公开文档） | 这版接受的新名 | 来源 |
+|---|---|---|
+| `--train_type lora` | **`--tuner_type lora`** | `materials/swift_training.docx` debug 段落 `SftArguments(tuner_type='lora', ...)` |
+| `--quantization_bit 4` | **`--quant_bits 4`** | 排除法验证（旧名进 remaining_argv，新名不进） |
+
+中间还试过 `--sft_type lora` 也被拒——排除法把第三种命名候选锁定。
+
+**解决方案** — `notebooks/notebook.ipynb` cell-2-sft-train：换成 `--tuner_type lora` 和 `--quant_bits 4`，并加注释保留两组对应关系，方便以后跨版本回退。
+
+**涉及文件**: `notebooks/notebook.ipynb` cell-2-sft-train
+
+---
+
+### 问题 10 — T4 不支持 bf16 / flash-attn 2.x（硬件层面）
+
+**现象**
+- `--bf16 true` 在 T4 上不报错，但训练慢（软件模拟）；混合精度数值不稳的间接表现是 loss 爆炸/收敛差
+- `pip install "flash-attn==2.8.3"` 在 Colab T4 上编译失败或运行时报"unsupported architecture"
+
+**根因**
+
+| 硬件 | Compute Capability | bf16 native | flash-attn 2.x |
+|---|---|---|---|
+| Colab 免费 T4 | 7.5 (Turing) | **❌** | **❌**（要求 SM ≥ 8.0） |
+| AutoDL 4080 SUPER | 8.9 (Ada Lovelace) | ✅ | ✅ |
+| A100 / H100 | 8.0 / 9.0 | ✅ | ✅ |
+
+我们想"一份 notebook 跨硬件跑"，必须运行时检测。
+
+**解决方案**
+
+1. **SFT CLI**（cell-2-sft-train）— T4 路径用 fp16：
+   ```
+   --bnb_4bit_compute_dtype float16   # 不是 bfloat16
+   --fp16 true                        # 不是 --bf16 true
+   ```
+2. **推理 cell**（cell 3.5a `74056ebe`）— 自动检测：
+   ```python
+   _compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+   ```
+   `BitsAndBytesConfig(bnb_4bit_compute_dtype=_compute_dtype)` 和
+   `from_pretrained(..., torch_dtype=_compute_dtype)` 都跟随。
+3. **不装 flash-attn 2.x**，让 transformers 自动选 sdpa attention（PyTorch 内置，T4 上工作良好）。
+
+**涉及文件**: `notebooks/notebook.ipynb` cell-2-sft-train, cell `74056ebe` (3.5a), cell `ae6d1495` (DPO 加载)
+
+---
+
+### 问题 11 — Qwen3.5 是 VL + GatedDeltaNet 模型，依赖栈被低估
+
+**现象**
+
+加载时警告：
+```
+Please install the package: `pip install "qwen_vl_utils>=0.0.14" "decord" -U`.
+```
+以及：
+```
+The fast path is not available because one of the required library is not installed.
+Falling back to torch implementation. To install follow ...flash-linear-attention... causal-conv1d
+```
+
+**根因**
+
+我们之前 cell 注释写"text-only Qwen3.5-4B base / no ViT"——**完全错**。`materials/qwen3.5_key_points.docx` 明确说：
+
+> Qwen3.5 属于**混合思考的多模态模型**，结合了 linear attention (GatedDeltaNet) 和 full attention。
+
+即使我们做纯文本任务，模型加载时仍要：
+- `qwen_vl_utils` — 模型类初始化时检查
+- `flash-linear-attention` (fla) + `causal-conv1d` — GatedDeltaNet 的快速 kernel；缺则降级到 torch 实现，慢但能跑
+
+**解决方案** — `cell-setup-2` 重写依赖列表：
+```bash
+pip install -U "transformers==5.2.*" "qwen_vl_utils>=0.0.14" peft trl liger-kernel \
+                bitsandbytes accelerate ms-swift modelscope ...
+pip install -U "flash-linear-attention>=0.4.2" --no-build-isolation
+pip install -U "git+https://github.com/Dao-AILab/causal-conv1d" --no-build-isolation
+```
+
+**故意不装** flash-attn 2.x（见问题 10）。`transformers==5.2.*` 是 docx 锁的版本（5.1 没 Qwen3.5，5.3 视频 dataloader 坏）。
+
+**附带**：思考模式三件套（防 base 模型生成长 `<think>...</think>` 破坏 `LABEL ##[..]##` 格式）：
+```
+--enable_thinking false
+--add_non_thinking_prefix true
+--loss_scale ignore_empty_think
+```
+
+**涉及文件**: `notebooks/notebook.ipynb` cell-setup-2, cell-2-sft-train, cell-2-sft-download, cell-2-sft (md)
+
+---
+
+### 问题 12 — Track 1 全 154 条 0 秒跑完 + 静默 `AttributeError()`
+
+**现象**
+```
+predict: 100%|...| 154/154 [00:00<00:00, 967.59it/s]
+  WARN claim-XXX: AttributeError()       (× 154)
+Track 1 (Base, no RAG) acc=0.2662 F=0.0000 HM=0.0000 (0.1s)
+```
+
+`AttributeError()` 没有 message body，每条 claim < 1 ms 就抛错——根本没到 `model.generate()`。`acc≈0.27` 接近 NEI 的占比 31%，说明每条都走了 `except` 兜底默认 `NOT_ENOUGH_INFO`。
+
+**根因**（用 smoke test 脚本探针逐步定位）
+
+`apply_chat_template(..., return_tensors="pt")` 在 transformers 5.x 上**返回 `BatchEncoding`（dict-like），不是 tensor**。我们 `src/inference.py` 三处都把它当 tensor 用：
+```python
+prompt_ids = tokenizer.apply_chat_template(...).to(self.model.device)
+# ...
+new_ids = out[0][prompt_ids.shape[1]:]
+```
+`BatchEncoding.__getattr__('shape')` → 内部走 `self.data['shape']` → KeyError → 转译成无 message 的 `AttributeError`。`predict_all` 的 `except Exception` 把 traceback 完全吞了，只剩单行 WARN。
+
+**解决方案**
+
+1. `src/inference.py` 加统一 helper：
+   ```python
+   def _apply_template_to_device(tokenizer, msgs, device):
+       encoded = tokenizer.apply_chat_template(
+           msgs, return_tensors="pt", add_generation_prompt=True,
+           enable_thinking=False,
+       )
+       prompt_ids = encoded if torch.is_tensor(encoded) else encoded["input_ids"]
+       return prompt_ids.to(device)
+   ```
+   `ModelInferer.predict` / `NoRagInferer.predict` 全部走 helper。`ZeroShotInferer` 继承自动跟进。
+2. notebook `cell-2-infer-code` 的内联 `infer_one()` 同步打补丁。
+3. **同时** 改 `predict_all`，前 3 个错误打完整 traceback 而非只打 repr：
+   ```python
+   if _err_traces_shown < 3:
+       print(f"  WARN {cid}: {e!r}")
+       _tb.print_exc()
+   ```
+   防止以后再被静默 AttributeError 困住。
+
+**复用价值**：transformers 5.x 在多处行为变了，BatchEncoding 是高频踩坑。鸭子类型判断（`torch.is_tensor` else `["input_ids"]`）比依赖 tokenizer 类名更稳。
+
+**涉及文件**: `src/inference.py`, `notebooks/notebook.ipynb` cell-2-infer-code
+
+---
+
+### 问题 13 — AutoDL 实例 PyTorch + driver + CUDA toolkit 三向不匹配
+
+**现象**
+
+`pip install -U "git+.../causal-conv1d" --no-build-isolation` 编译失败：
+```
+RuntimeError: ('The detected CUDA version (%s) mismatches the version that was
+used to compilePyTorch (%s).', '12.4', '13.0')
+```
+更上面还有：
+```
+UserWarning: CUDA initialization: The NVIDIA driver on your system is too old
+(found version 12060). Please update your GPU driver
+```
+
+**根因**
+
+| 组件 | 版本 |
+|---|---|
+| PyTorch | 2.11.0+**cu130** |
+| CUDA toolkit | 12.4 |
+| GPU driver | 12.6（上限） |
+
+PyTorch 用 CUDA 13 编译，但 driver 只支持到 12.6。即使 causal-conv1d 不装，后续 bitsandbytes 4-bit / liger-kernel / 训练 forward 都会接连炸。这是个**镜像层面**的根因。
+
+**解决方案**
+
+不在原实例修，**直接销毁 + 重建**，选 AutoDL 标准镜像：`PyTorch 2.5.1 + CUDA 12.4 + Python 3.12`。新实例验证：
+```bash
+nvidia-smi  # CUDA 12.6 driver
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+# torch 2.5.1+cu124, cuda 12.4, ok True
+```
+
+后续 causal-conv1d / fla 编译都顺利。
+
+**复用经验**：环境冲突类问题，与其在原镜像上往回卸装重装，不如**重建实例**。AutoDL 创建一个新实例只要几分钟，远比折腾 conda + cu* 各种版本号便宜。
+
+**涉及文件**: 无代码改动（环境层）；`scripts/test_qwen35_inference.py` 的 Section 1 会自动 dump 这些版本号
+
+---
+
+### 问题 14 — Python 模块缓存让 src/inference.py 修改不生效
+
+**现象**
+
+修复问题 12 后，文件磁盘上有改动（`grep "_apply_template_to_device" src/inference.py` 命中 3 行），但 Track 1 重跑还是 0 秒报 154 条 AttributeError —— **完全跟没修一样**。
+
+**根因**
+
+Notebook kernel 第一次 `from src.inference import NoRagInferer` 时 Python 把 `src.inference` 模块缓存进了 `sys.modules`。之后即使文件改了，再 `from ... import` 拿到的还是旧版本的 `NoRagInferer` 类对象。
+
+**解决方案**
+
+1. **强烈推荐** Runtime → Restart session。一次干净，不留隐式状态。
+2. 不想重启时（避免重下模型）的最小干预：
+   ```python
+   import sys
+   for m in list(sys.modules):
+       if m == "src.inference" or m.startswith("src.inference."):
+           del sys.modules[m]
+   from src.inference import NoRagInferer  # 重新导入
+   ```
+3. 用诊断 cell 强制确认加载到的是哪一份：
+   ```python
+   import src.inference
+   print("file:", src.inference.__file__)
+   print("has helper?", hasattr(src.inference, "_apply_template_to_device"))
+   ```
+
+**复用经验**：改了 `src/*.py` 之后，先跑 1 条诊断 print 确认新代码在跑，再做大批量调用。否则一旦失败，无法分辨"代码 bug"和"模块缓存"。
+
+---
+
+### 问题 15 — SFT 数据迁移到 ms-swift messages 标准格式
+
+**背景**
+
+之前 SFT 数据格式是 `{id, system, query, response, _meta}`（query-response 形式）。`materials/训练数据格式.docx` §2.1 说 ms-swift 的 AutoPreprocessor **能自动转**这种格式，但官方推荐 **messages 列表**为标准/无歧义格式。考虑到我们已经撞过 v3.6+ 分支若干隐式行为变化，迁移到 messages 更稳。
+
+**新 schema**（per docx §2.1 / §3.3）
+
+SFT：
+```json
+{"messages": [
+  {"role": "system",    "content": "<SYSTEM_PROMPT>"},
+  {"role": "user",      "content": "<query>"},
+  {"role": "assistant", "content": "LABEL ##[indices]##"}
+]}
+```
+
+DPO：
+```json
+{"messages": [system, user, assistant=chosen],
+ "rejected_response": "..."}
+```
+
+**改动**
+
+| 文件 | 改动 |
+|---|---|
+| `src/sft_dataset.py` | `build_sft_record` + `build_hard_negative_record` 输出 messages 三元组；docstring 加 docx 出处 |
+| `src/dpo_pairs.py` | `build_dpo_pair` / `synthesise_disputed_contrast` 改写；新增 `_messages_with_chosen()` helper 复用 [system,user] 并替换 assistant 为 chosen |
+| `tests/test_sft_dataset.py` | 断言改成 `r["messages"][2]["content"]` 风格；本地 all green |
+| `tests/test_dpo_pairs.py` | fixture 改成 messages 形式；本地 all green |
+| `notebooks/notebook.ipynb` cell-1-sft (md) | 描述改成 messages 格式 |
+
+**ms-swift 兼容性**：保留 `id` / `_meta` 顶级字段——ms-swift 忽略未知 key，下游（curriculum sort / DPO 配对 / ablation 切片）依然能用。
+
+**用户需要做的**：在 Colab/AutoDL 重跑 `cell-1-sft-code` 重新生成 `outputs/sft_data/sft_train_v1.jsonl`。
+
+**涉及文件**: 见上表
+
+---
+
+## 复用经验（会话 2 增量）
+
+### 9. transformers 5.x 的隐式行为变化清单
+- `apply_chat_template(return_tensors="pt")` 返回 `BatchEncoding` 而非 Tensor → 必须 `if torch.is_tensor(x) else x["input_ids"]`
+- `BatchEncoding.__getattr__` 缺 key 时抛**无 message 的 AttributeError** —— 排查 silent error 时第一个怀疑这个
+- tokenizer 类名变成 `TokenizersBackend`（不是 `Qwen2Tokenizer`），代码不要 `isinstance(tok, Qwen2Tokenizer)` 这种硬判断
+
+### 10. Qwen3.5（VL + GatedDeltaNet）必备依赖栈
+```
+"transformers==5.2.*"            # 5.1 缺模型，5.3 视频坏
+"qwen_vl_utils>=0.0.14"          # VL 模型加载即检查
+"flash-linear-attention>=0.4.2"  # GatedDeltaNet kernel
+git+.../causal-conv1d            # 同上配套
+liger-kernel                     # 可选但训练显存大幅省
+```
+**不装** flash-attn 2.x（要 SM ≥ 8.0），sdpa attention 在 Turing 上更稳。
+
+### 11. T4 vs Ampere+ 的 dtype 选择（硬件运行时检测）
+```python
+_compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+```
+所有 `BitsAndBytesConfig` / `from_pretrained` / SFT CLI 都跟随。**永远不要**硬编码 `bfloat16`。
+
+### 12. Qwen3.5 思考模式三件套（防 base 模型乱输出）
+训练侧（CLI）：
+```
+--enable_thinking false
+--add_non_thinking_prefix true
+--loss_scale ignore_empty_think
+```
+推理侧（code）：
+```python
+tokenizer.apply_chat_template(msgs, ..., enable_thinking=False)
+```
+两端必须一致，否则 train/inference 行为不匹配。
+
+### 13. ms-swift CLI 参数命名跨版本差异速查
+
+| 概念 | 旧名 | 新名（v3.6+） |
+|---|---|---|
+| 训练方式 | `--train_type`（公开文档） / `--sft_type`（v1.x） | **`--tuner_type`** |
+| 量化位数 | `--quantization_bit` | **`--quant_bits`** |
+| 思考开关 | (无) | `--enable_thinking false` |
+| 思考前缀 | (无) | `--add_non_thinking_prefix true` |
+| 损失忽略空 think | (无) | `--loss_scale ignore_empty_think` |
+| Liger fused kernel | (无) | `--use_liger_kernel true` |
+| 长度分组（替代 packing） | (无) | `--group_by_length true` |
+| ckpt 数量上限 | (无) | `--save_total_limit N` |
+
+跑前先 `swift sft --help | grep -iE "(tuner|quant|think|liger)"` 确认。
+
+### 14. 改 src/*.py 后的强制确认习惯
+1. `grep` 文件验证磁盘有新代码
+2. notebook 跑诊断 cell 验证 `sys.modules['src.X'].__file__` 指向新文件 + 新 attr 存在
+3. 才跑业务 cell
+
+### 15. 错误处理别吞 traceback
+`predict_all` 的 `except Exception as e: print(repr(e))` 是反模式——空 AttributeError 直接看不出来源。改成"前 N 次打完整 traceback，之后只打 repr"。一行 `traceback.print_exc()` 救命。
+
+### 16. 环境层冲突优先重建实例而不是降级
+AutoDL / Colab 这种容器化环境，建实例比 conda 里把 PyTorch 从 cu130 降到 cu124 + 重装一堆 CUDA 包快得多。镜像选错了，5 分钟重建胜过 1 小时排错。
+
+### 17. Standalone smoke-test 脚本的价值
+`scripts/test_qwen35_inference.py` 不依赖 notebook、不依赖 RAG 索引，独立验证：env / 模型加载 / tokenizer 行为 / 推理路径。一次跑出 4 个 section，能在 5 分钟内回答："模型本身能不能跑、能不能听懂格式、SC 在易题/难题上分别表现如何"。新模型 / 新硬件第一步永远是它。
+
+### 18. SC（self-consistency）在易题上是浪费
+4080 SUPER + 4-bit 量化 + base 模型，简单 SUPPORTS claim 5 次采样 5/5 一致（T=0.7 都没扰动）。SC 真正有价值的场景是 **DISPUTED / 模糊 / 模型置信度低** 的样本。Track 4 的 SC 可以考虑只对低置信度样本启用（节省 5× 成本）。
+
+---
+
+## 修改文件清单（会话 2 增量）
+
+| 文件 | 改动概要 |
+|---|---|
+| `cell-setup-2` | 依赖列表完全重写：transformers==5.2.*、qwen_vl_utils、fla、causal-conv1d、liger-kernel；明确不装 flash-attn 2.x（T4 不支持） |
+| `cell-2-sft-download` | 注释改正：Qwen3.5 是 VL + 混合思考模型；保留只用文本路径 |
+| `cell-2-sft` (markdown) | 描述加 T4 硬件警告 + 显存策略堆叠 |
+| `cell-2-sft-train` | `--train_type` → `--tuner_type`；`--quantization_bit` → `--quant_bits`；新增 thinking 三件套 + `--use_liger_kernel` + `--group_by_length` + `--save_total_limit`；T4 路径用 `--fp16 true` + `bnb_4bit_compute_dtype float16` |
+| `cell-2-infer-code` | `infer_one` 内联同款 BatchEncoding 处理 + `enable_thinking=False` |
+| cell `74056ebe` (3.5a) | `_compute_dtype = bf16 if supported else fp16`；`BitsAndBytesConfig` / `from_pretrained` 都跟随；显式注释不指定 attn_implementation |
+| cell `ae6d1495` (3.5 load adapter) | DPO 加载也用 `_compute_dtype` |
+| cell-1-sft (markdown) | SFT schema 描述从 `{system,query,response}` 改成 messages 三元组；附 docx 引用 |
+| `src/inference.py` | 新增 `_apply_template_to_device` helper；`ModelInferer` / `NoRagInferer` 都过它；`predict_all` 前 3 个错误打完整 traceback |
+| `src/sft_dataset.py` | `build_sft_record` + `build_hard_negative_record` 输出 messages 格式；docstring 加 docx 出处 |
+| `src/dpo_pairs.py` | 新增 `_messages_with_chosen` helper；`build_dpo_pair` + `synthesise_disputed_contrast` 改写；docstring 改 |
+| `tests/test_sft_dataset.py` | 断言改成 messages 形式；all green |
+| `tests/test_dpo_pairs.py` | fixture 改成 messages 形式；all green |
+| **新建** `scripts/test_qwen35_inference.py` | Standalone smoke test：env 探针 + model 加载（auto dtype）+ tokenizer 行为探针 + 4 个推理 section（4a no-RAG / 4b RAG fake ev / 4c SC on DISPUTED + mixed ev / 4d 可选 real RAG，gated on cached indices） |
+
+---
+
+## 实测数据（AutoDL 4080 SUPER, 4-bit）
+
+`scripts/test_qwen35_inference.py` 在 base Qwen3.5-4B 上跑出的关键数字：
+
+- **加载**：8GB 模型下载 ~9 min（ModelScope）；加载耗时 7.9 s；4-bit 加载后 VRAM 2.9 GB
+- **Section 4a (no-RAG, greedy)**：3 条样本 SUPPORTS / REFUTES / NEI 中，前两条**正确**；NEI 那条 base 模型给 REFUTES（base 模型常见缺陷：没有"我不知道"概念）
+- **Section 4b (RAG fake ev, greedy)**：模型严格按 `LABEL ##[1,2]##` 输出，证明 prompt 格式可学
+- **Section 4c (SC, easy SUPPORTS)**：5/5 一致 → 该 claim SC 无价值；后改成 DISPUTED claim 验证 SC 真实分歧情况
+
+**结论**：base 模型已具备 prompt 跟随能力，但 NEI 类需要 SFT 教，SC 在易题上无收益。直接进入 SFT 阶段。
+
+---
+
+## 当前进度（会话 2 收口）
+
+### 已完成
+- [x] swift CLI 参数名问题三连解（问题 9）
+- [x] T4 hardware 自适应（问题 10）
+- [x] Qwen3.5 依赖栈补全（问题 11）
+- [x] BatchEncoding bug + helper（问题 12）
+- [x] AutoDL 镜像重建（问题 13）
+- [x] 模块缓存绕过手册（问题 14）
+- [x] SFT/DPO 数据迁移到 messages 格式 + tests 全绿（问题 15）
+- [x] Standalone smoke test 脚本，AutoDL 上跑通
+
+### 进行中
+- [ ] AutoDL 上重新生成 messages 格式的 `sft_train_v1.jsonl`（cell-1-sft-code 重跑）
+- [ ] AutoDL 上跑 SFT（cell-2-sft-train 取消注释 `!{cmd}` 实跑）
+- [ ] 跑改进版 4c 看 SC 在 DISPUTED claim 上能否拉开分歧
+
+### 未触及
+- [ ] DPO 训练（依赖 SFT checkpoint）
+- [ ] 4-track 完整评测（依赖 SFT + DPO checkpoint）
+- [ ] 真实 RAG 在 AutoDL 上的索引构建（BM25 + dense）→ 才能开 `--with-real-rag` 跑 smoke test 4d
+
+---
+
+## 断点续跑指南（AutoDL 版补充）
+
+| 缺失 | 重做 | 耗时 |
+|---|---|---|
+| 整个实例（被释放/欠费） | AutoDL 重建实例 + git clone + 重装依赖 | ~15 min |
+| Python env | `pip install -U ...`（按 cell-setup-2 列表） | ~5 min |
+| Qwen3.5-4B 模型权重 | `python -m scripts.test_qwen35_inference` 自动下载 | ~10 min（首次） |
+| messages 格式 SFT 数据 | 跑 cell-1-sft-code 重新 build_dataset | <30 s |
+| BM25 索引 | 跑 cell 2.1 | ~3 min |
+| dense 索引 | 跑 cell 2.2（首次 ~30 min；用 4080 比 T4 快很多） | ~15 min（4080 估算） |
