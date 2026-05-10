@@ -41,13 +41,10 @@ class DenseRetriever:
     def _load_model(self):
         if self._model is None:
             from sentence_transformers import SentenceTransformer
-            # Force safetensors to bypass torch<2.6 + transformers CVE-2025-32434
-            # check that blocks .bin via torch.load. bge-m3 ships both formats.
-            self._model = SentenceTransformer(
-                self.model_name,
-                device=self.device,
-                model_kwargs={"use_safetensors": True},
-            )
+            # Note: bge-m3 ships only pytorch_model.bin (no safetensors). Loading
+            # via torch.load() requires either torch>=2.6 OR transformers<4.50;
+            # see environment_setting.md Q8 / requirements.txt pin.
+            self._model = SentenceTransformer(self.model_name, device=self.device)
             self._model.max_seq_length = self.max_seq_length
             if self.fp16 and self.device.startswith("cuda"):
                 self._model.half()

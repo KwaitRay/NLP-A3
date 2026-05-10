@@ -157,6 +157,16 @@ conda install -c conda-forge faiss-cpu -y
 python -m spacy download en_core_web_sm
 ```
 
+### Q5b：`python -m spacy download en_core_web_sm` 卡在 `Connection to github.com timed out` 或 `403 Forbidden`
+→ AutoDL 国内网络访问 GitHub 不稳定，spaCy 模型托管在 GitHub Releases。开 AutoDL 学术加速：
+```bash
+source /etc/network_turbo
+python -m spacy download en_core_web_sm
+python -c "import nltk; nltk.download('wordnet'); nltk.download('omw-1.4')"
+```
+加速代理仅当前 shell 有效，配完环境就可以关掉（`unset http_proxy https_proxy`）。
+pip 装 pypi 包不需要开（已用国内镜像更快）。
+
 ### Q6：`LookupError: Resource wordnet not found`
 → NLTK 数据未下：
 ```bash
@@ -171,16 +181,16 @@ python -m ipykernel install --user --name nlp_a3 --display-name "Python (nlp_a3)
 ```
 然后 JupyterLab 顶部菜单 Kernel → Change Kernel → 选 nlp_a3。
 
-### Q8：`ValueError: ... upgrade torch to at least v2.6 ... CVE-2025-32434`
-→ 新 transformers (≥4.50) 安全检查 + 旧 torch (<2.6) + 模型只有 `.bin` 文件三者叠加。两种修法：
+### Q8：`ValueError: ... upgrade torch to at least v2.6 ... CVE-2025-32434`  /  `OSError: ... does not appear to have a file named model.safetensors`
+→ 新 transformers (≥4.50) 安全检查 + 旧 torch (<2.6) + 模型只有 `.bin` 文件三者叠加。
+**`bge-m3` 在 HF Hub 上只有 `pytorch_model.bin`，没有 safetensors**，所以 `use_safetensors=True` 不可行。
 
-**修法 1（推荐）**：让 sentence-transformers 强制只加载 safetensors。
-`src/retrieval/dense.py` 的 `_load_model` 里 `SentenceTransformer(...)` 调用加 `model_kwargs={"use_safetensors": True}`。
-
-**修法 2**：降级 transformers 到 CVE 检查之前的版本：
+**唯一可靠修法**：降级 transformers 到 CVE 检查之前的版本：
 ```bash
-pip install "transformers>=4.46,<4.50"
+pip install "transformers>=4.46,<4.50" -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
+重启 kernel 后即可加载 bge-m3 的 `.bin` 权重（`requirements.txt` 已经钉死 `<4.50.0`，
+但若是用 conda env 之外的 site-packages 装的可能仍是新版，跑上面命令强制覆盖）。
 
 ### Q9：模型下载特别慢 / 失败
 - ModelScope 在国内直连，**优先**用 ModelScope 而非 HuggingFace：
