@@ -28,6 +28,7 @@ from .prompt import (
     SYSTEM_PROMPT,
     build_no_rag_query,
     build_user_query,
+    get_variant_system,
     parse_response,
 )
 
@@ -79,6 +80,7 @@ class ModelInferer:
         top_p: float = 0.9,
         max_new_tokens: int = 32,
         default_label: str = "NOT_ENOUGH_INFO",
+        prompt_version: str = "v1",
     ) -> None:
         self.retriever = retriever
         self.model = model
@@ -88,6 +90,7 @@ class ModelInferer:
         self.top_p = top_p
         self.max_new_tokens = max_new_tokens
         self.default_label = default_label
+        self.prompt_version = prompt_version
 
     def _generate_one(self, prompt_ids):
         """One sampled completion. Returns the decoded continuation only."""
@@ -108,9 +111,9 @@ class ModelInferer:
         if not retrieved:
             return {"claim_label": self.default_label, "evidences": []}
         shown_ids = [eid for eid, _ in retrieved]
-        user = build_user_query(claim_text, retrieved)
+        user = build_user_query(claim_text, retrieved, version=self.prompt_version)
         msgs = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": get_variant_system(self.prompt_version)},
             {"role": "user", "content": user},
         ]
         prompt_ids = _apply_template_to_device(self.tokenizer, msgs, self.model.device)
@@ -182,16 +185,18 @@ class NoRagInferer:
         *,
         max_new_tokens: int = 16,
         default_label: str = "NOT_ENOUGH_INFO",
+        prompt_version: str = "v1",
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.max_new_tokens = max_new_tokens
         self.default_label = default_label
+        self.prompt_version = prompt_version
 
     def predict(self, claim_text: str) -> dict[str, Any]:
         msgs = [
-            {"role": "system", "content": NO_RAG_SYSTEM_PROMPT},
-            {"role": "user", "content": build_no_rag_query(claim_text)},
+            {"role": "system", "content": get_variant_system(self.prompt_version, no_rag=True)},
+            {"role": "user", "content": build_no_rag_query(claim_text, version=self.prompt_version)},
         ]
         prompt_ids = _apply_template_to_device(self.tokenizer, msgs, self.model.device)
         out = self.model.generate(
