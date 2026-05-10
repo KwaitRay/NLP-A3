@@ -237,15 +237,27 @@ def run_inference(model, tokenizer, n_samples: int):
         print(f"    raw:    {text!r}")
         print(f"    parsed: label={label}  evidences={ev_ids}  ({dt:.2f}s)")
 
-    # 4c. Self-consistency sampling (Track 4 style)
-    print(f"\n  --- 4c. Self-consistency sampling (n={n_samples}, T=0.7) ---")
-    cid, claim = sample_claims[0]
+    # 4c. Self-consistency sampling (Track 4 style) — DISPUTED claim + mixed
+    # evidence. The earlier version used an easy SUPPORTS claim where 5/5
+    # samples agreed (T=0.7 didn't perturb a confident model), so SC was
+    # trivially "useful". This version stress-tests SC on a genuinely
+    # ambiguous case where evidence is split: ev-A supports, ev-B refutes.
+    # We *want* to see disagreement across the 5 samples; if they all still
+    # agree, SC adds no value on this claim either.
+    print(f"\n  --- 4c. Self-consistency on DISPUTED claim (n={n_samples}, T=0.7) ---")
+    disputed_claim = "Cloud feedback significantly amplifies global warming."
+    mixed_evidences = [
+        ("ev-pro", "Climate model intercomparison projects (CMIP6) generally show net positive cloud feedback that amplifies warming by 0.3 to 0.8 K per doubling of CO2."),
+        ("ev-con", "Recent satellite-based observational studies (Ceppi 2024) suggest the cloud feedback may be smaller and more uncertain than CMIP6 models predict."),
+        ("ev-off", "Eurasian dust transport patterns have been studied via Lidar networks since the 1990s."),
+    ]
     msgs = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": build_user_query(claim, fake_evidences)},
+        {"role": "user", "content": build_user_query(disputed_claim, mixed_evidences)},
     ]
     prompt_ids = _to_input_ids(tokenizer, msgs, model.device)
-    print(f"\n  [{cid}] claim: {claim}")
+    print(f"\n  [c-disputed] claim: {disputed_claim}")
+    print(f"  evidences: ev-pro (supports) / ev-con (refutes) / ev-off (irrelevant)")
     t0 = time.time()
     samples = []
     for i in range(n_samples):
@@ -256,13 +268,115 @@ def run_inference(model, tokenizer, n_samples: int):
                 pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
             )
         text = tokenizer.decode(out[0][prompt_ids.shape[1]:], skip_special_tokens=True)
-        lbl, evs = parse_response(text, shown_evidence_ids=[e for e, _ in fake_evidences])
+        lbl, evs = parse_response(text, shown_evidence_ids=[e for e, _ in mixed_evidences])
         samples.append((lbl, evs, text))
         print(f"    sample {i+1}: label={lbl}  evidences={evs}  raw={text!r}")
     dt = time.time() - t0
     from collections import Counter
-    final_label = Counter(s[0] for s in samples).most_common(1)[0][0]
-    print(f"\n    → majority label: {final_label}  ({dt:.2f}s total, {dt/n_samples:.2f}s/sample)")
+    counts = Counter(s[0] for s in samples)
+    final_label = counts.most_common(1)[0][0]
+    print(f"\n    → majority label: {final_label}  (vote distribution: {dict(counts)})")
+    print(f"    → {dt:.2f}s total, {dt/n_samples:.2f}s/sample")
+    if len(counts) == 1:
+        print("    NOTE: 5/5 agreement — SC adds no value on this claim. Try a harder one.")
+    else:
+        print(f"    NOTE: {len(counts)} distinct labels emerged → SC has value here.")
+
+
+def run_real_rag(model, tokenizer, n_claims: int = 3) -> None:
+    """4d. End-to-end Track-2 path: real BM25(+dense+rerank) → model.
+
+    Gated on cached indices existing on disk. Keeps the smoke test fast for
+    the common case (model + prompt validation only); only opt in via
+    --with-real-rag when you've already built the indices on this box.
+    """
+    _h("4d. Real RAG pipeline (Track 2 end-to-end)")
+    repo_root = Path(__file__).resolve().parent.parent
+    bm25_dir  = repo_root / "outputs" / "bm25_index"
+    dense_dir = repo_root / "outputs" / "dense_index"
+    evidence_path = repo_root / "data" / "evidence.json"
+
+    missing = []
+    if not evidence_path.exists():
+        missing.append(f"evidence corpus ({evidence_path})")
+    if not bm25_dir.exists():
+        missing.append(f"BM25 index ({bm25_dir})")
+    if missing:
+        print("  SKIPPED — required artifacts missing:")
+        for m in missing:
+            print(f"    - {m}")
+        print("  Build them first via the notebook cells 2.1 (BM25) and optionally 2.2 (dense),")
+        print("  or copy a pre-built index into outputs/. Re-run with --with-real-rag once ready.")
+        return
+
+    print(f"  loading evidence corpus from {evidence_path} ...")
+    from src.data_io import load_evidence, load_dev
+    evidence = load_evidence(evidence_path, show_progress=True)
+    print(f"  evidence: {len(evidence):,} passages")
+
+    from src.retrieval.bm25 import BM25Retriever
+    from src.retrieval.pipeline import RetrievalPipeline, RetrievalConfig
+    bm25 = BM25Retriever.load(bm25_dir)
+    print(f"  BM25 loaded from {bm25_dir}")
+
+    dense = None
+    reranker = None
+    if dense_dir.exists() and (dense_dir / "faiss.index").exists():
+        try:
+            from src.retrieval.dense import DenseRetriever
+            dense = DenseRetriever.load(dense_dir, max_seq_length=256, fp16=True)
+            print(f"  dense loaded from {dense_dir}")
+            from src.retrieval.rerank import CrossEncoderReranker
+            reranker = CrossEncoderReranker()
+            print(f"  cross-encoder reranker loaded")
+        except Exception as e:
+            print(f"  dense/reranker load failed ({type(e).__name__}: {e}); using BM25 only")
+
+    cfg = RetrievalConfig(
+        use_bm25=True, use_dense=dense is not None,
+        use_rerank=reranker is not None,
+        use_rule_reorder=False,  # rule_reorder needs spaCy; skip in smoke test
+        final_k=5,
+    )
+    pipe = RetrievalPipeline(
+        evidence_corpus=evidence, bm25=bm25, dense=dense, reranker=reranker, cfg=cfg,
+    )
+
+    dev = load_dev()
+    sample_ids = list(dev.keys())[:n_claims]
+    print(f"\n  running {len(sample_ids)} dev claims through Track 2 (RAG → model greedy)\n")
+
+    import torch
+    for cid in sample_ids:
+        claim = dev[cid]
+        gold_label = claim["claim_label"]
+        gold_evs = set(claim["evidences"])
+        t_ret = time.time()
+        retrieved = pipe.retrieve(claim["claim_text"])
+        ret_dt = time.time() - t_ret
+        shown_ids = [eid for eid, _ in retrieved]
+        hits = sum(1 for eid in shown_ids if eid in gold_evs)
+
+        msgs = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": build_user_query(claim["claim_text"], retrieved)},
+        ]
+        prompt_ids = _to_input_ids(tokenizer, msgs, model.device)
+        t_gen = time.time()
+        with torch.no_grad():
+            out = model.generate(
+                prompt_ids, do_sample=False, max_new_tokens=32,
+                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+            )
+        gen_dt = time.time() - t_gen
+        text = tokenizer.decode(out[0][prompt_ids.shape[1]:], skip_special_tokens=True)
+        pred_label, pred_evs = parse_response(text, shown_evidence_ids=shown_ids)
+        label_ok = "✓" if pred_label == gold_label else "✗"
+        print(f"  [{cid}] claim: {claim['claim_text'][:80]}")
+        print(f"    gold:     {gold_label}  evidences={list(gold_evs)[:3]}{'...' if len(gold_evs)>3 else ''}")
+        print(f"    retrieved {len(shown_ids)} (gold-hit {hits}/{len(gold_evs)}, {ret_dt:.2f}s)")
+        print(f"    raw:      {text!r}")
+        print(f"    pred:     {label_ok} {pred_label}  evidences={pred_evs}  ({gen_dt:.2f}s)\n")
 
 
 # --- main ------------------------------------------------------------------
@@ -278,14 +392,26 @@ def main():
         help="Skip 4-bit quantization (use only on >=24 GB GPUs).",
     )
     p.add_argument("--n-samples", type=int, default=5, help="Self-consistency sample count.")
+    p.add_argument(
+        "--with-real-rag", action="store_true",
+        help="Run section 4d (real BM25+dense+rerank pipeline). Requires "
+             "outputs/bm25_index/ (and optionally outputs/dense_index/) to exist "
+             "and data/evidence.json to be downloaded.",
+    )
+    p.add_argument(
+        "--rag-claims", type=int, default=3,
+        help="Number of dev claims to run through real RAG (only with --with-real-rag).",
+    )
     args = p.parse_args()
 
     dump_env()
     model, tokenizer = load_model(args.model_dir, quantize=not args.no_quantize)
     probe_tokenizer(tokenizer)
     run_inference(model, tokenizer, args.n_samples)
+    if args.with_real_rag:
+        run_real_rag(model, tokenizer, n_claims=args.rag_claims)
     _h("Done")
-    print("  All four sections completed without hard error.")
+    print("  All sections completed without hard error.")
 
 
 if __name__ == "__main__":
