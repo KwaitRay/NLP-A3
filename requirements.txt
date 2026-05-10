@@ -1,18 +1,43 @@
 # COMP90042 Assignment 3 — Hybrid RAG Climate Fact-Checker
-# ────────────────────────────────────────────────────────────
-# 在 conda env 里 pip 安装：
-#   conda create -n nlp_a3 python=3.12 -y
-#   conda activate nlp_a3
-#   pip install -r requirements.txt
+# ════════════════════════════════════════════════════════════════════════════
+#
+# AutoDL Quick Start（按顺序）:
+# ─────────────────────────────
+#   # 1. 创建实例时选 PyTorch 2.5.1 + CUDA 12.4 + Python 3.12 镜像（实测稳定）
+#   #    其他镜像 cu130 等会撞 driver 12.6 上限，详见 debug_log.md 问题 13
+#
+#   # 2. 拉代码 + 装依赖（国内源加速）
+#   cd ~/autodl-tmp && git clone https://github.com/<you>/NLP-A3.git && cd NLP-A3
+#   pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 #   python -m spacy download en_core_web_sm
 #   python -c "import nltk; nltk.download('wordnet'); nltk.download('omw-1.4')"
 #
-# AutoDL 国内环境加速：
-#   pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+#   # 3. （可选）装 SFT 训练加速 kernel — Phase 1 评估不需要
+#   pip install -U "flash-linear-attention>=0.4.2" --no-build-isolation
+#   pip install -U "git+https://github.com/Dao-AILab/causal-conv1d" --no-build-isolation
+#
+#   # 4. Smoke test —— 5 分钟验证模型/推理路径/SC 行为
+#   python -m scripts.test_qwen35_inference \
+#       --model-dir outputs/model_cache/Qwen/Qwen3___5-4B
+#
+#   # 5. 建检索索引（一次性 ~30-45 min）
+#   python -m scripts.build_indexes
+#
+#   # 6. Phase 1 评估 —— Track 1/2 × prompt 变体扫描（~15 min）
+#   python -m scripts.phase1_eval --tracks 1,2 --prompts v1,v2,v3,v4 \
+#       --dataset diag_test --model-dir outputs/model_cache/Qwen/Qwen3___5-4B
+#   # 输出在 outputs/eval_phase1/，看 summary_diag_test.md
+#
+# ────────────────────────────────────────────────────────────────────────────
+# 本地（无 GPU）跑 dry-run：
+#   conda create -n nlp_a3 python=3.12 -y && conda activate nlp_a3
+#   pip install -r requirements.txt
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   python -m scripts.dry_run
+# ────────────────────────────────────────────────────────────────────────────
 #
 # 注：torch / cuda 由 AutoDL 镜像预装，本文件不锁版本（避免覆盖镜像）。
-# 推荐镜像：PyTorch 2.5.1 + CUDA 12.4 + Python 3.12（与本项目实测一致）。
-# 如本地无 GPU：pip install torch --index-url https://download.pytorch.org/whl/cpu
+# 推荐镜像：PyTorch 2.5.1 + CUDA 12.4 + Python 3.12（实测稳定，2026-05）。
 
 # ── 训练框架（Qwen3.5 SFT + DPO via ms-swift）────────────
 ms-swift>=3.0.0                # CLI 路径 swift/pipelines/train/sft.py，参数名见 design.md §8.6
