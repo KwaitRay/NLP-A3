@@ -1,0 +1,37 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.ipynb_checkpoints/
+
+# Large data files / artifacts (never commit)
+data/evidence.json
+outputs/sft_data/*.jsonl
+outputs/splits/*.jsonl
+outputs/eda/*.png
+outputs/checkpoints/
+outputs/embeddings/
+outputs/bm25_index/
+outputs/dense_index/
+outputs/model_cache/
+outputs/sft-out/
+outputs/dpo-out/
+outputs/predictions/
+outputs/smoke/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+*.npy
+
+# Submission packaging
+*.zip
+
+# Local env
+.env
+.venv/
+venv/
+
+# Claude Code workspace (plans / personal config — not for sharing)
+.claude/

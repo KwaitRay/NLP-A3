@@ -1,0 +1,873 @@
+# COMP90042 Assignment 3 — Climate Fact-Checking RAG: 系统设计文档
+
+> **Authoritative tech design.** 项目落地时优先读此文档；仓库中 `~/.claude/plans/fancy-mapping-lemur.md` 是 plan-mode 阶段的双语方案，本文档把决策固化为单一可执行设计。
+>
+> 中文为主语；技术标识符（模型 ID、文件路径、库名、命令）保持原文。
+
+---
+
+## 目录
+
+1. [背景与目标](#1-背景与目标)
+2. [硬约束](#2-硬约束)
+3. [数据画像](#3-数据画像)
+4. [系统总览](#4-系统总览)
+5. [Stage 0 — SFT 数据构造](#5-stage-0--sft-数据构造)
+6. [Stage 1 — Hybrid 检索](#6-stage-1--hybrid-检索)
+7. [Stage 2 — Query 重写](#7-stage-2--query-重写)
+8. [Stage 3 — SFT (Qwen3.5-4B QLoRA)](#8-stage-3--sft-qwen35-4b-qlora)
+9. [Stage 4 — DPO 偏好对齐](#9-stage-4--dpo-偏好对齐)
+10. [Stage 5 — 自一致性推理](#10-stage-5--自一致性推理)
+11. [Stage 6 — 评估、消融、误差归因](#11-stage-6--评估消融误差归因)
+12. [代码组织](#12-代码组织)
+13. [Notebook 组织 + 状态标记](#13-notebook-组织--状态标记)
+14. [复现与提交](#14-复现与提交)
+15. [测试矩阵](#15-测试矩阵)
+16. [风险登记册](#16-风险登记册)
+17. [设计决策记录](#17-设计决策记录)
+18. [术语表](#18-术语表)
+
+---
+
+## 1. 背景与目标
+
+气候事实核查系统（automated fact-checking for climate claims），COMP90042 研究生 NLP 课程项目，**截止 2026-05-22**。给定一条声明：
+
+1. **检索**（Retrieval）：从 ~120 万段证据语料中找出最相关的若干段；
+2. **分类**（Classification）：基于检索到的证据将声明判为
+   `{SUPPORTS, REFUTES, NOT_ENOUGH_INFO, DISPUTED}` 之一。
+
+评测主指标 = **证据 F-score 与分类准确率的调和平均**（`eval.py`）。
+
+**核心目标**（按规范权重）：
+- 方法论严谨性（**Soundness, 8 分**）
+- 工作量与深度（Substance, 5 分）
+- 新颖性（**Novelty, 6 分**）
+- 结果与分析（Results, 6 分）
+- 写作清晰度（Writing, 7 分）
+- 学术引用（Citation, 3 分）
+
+**非目标**：
+- 不追求 leaderboard 第一名（参与可选，不影响分数）。
+- 不做闭源 API；不做手写规则；不做 ≥ 5B 参数训练。
+
+---
+
+## 2. 硬约束
+
+来自项目规范，违反 = 0 分。
+
+| 编号 | 约束 | 我们的应对 |
+|---|---|---|
+| §2.1 | 必须有序列建模组件（RNN/LSTM/GRU/Transformer 任一） | Transformer 全程 ✓（Qwen3.5、bge-m3、bge-reranker） |
+| §2.2 | LLM 仅限开源 | Qwen3.5 / bge-* 系列；ModelScope 下载 |
+| §2.3 | 必须能在免费 Colab T4（~15 GB VRAM, ~12 GB RAM）跑通 | QLoRA 4-bit + ViT 冻结 + grad_accum |
+| §2.4 | 禁用闭源 API（GPT/Claude/Gemini/Copilot） | 无 |
+| §2.5 | 禁用手写 if-then 分类规则 | 标签由模型 logits 给出 |
+| §2.6 | 禁用外部数据集（FEVER/Climate-FEVER 训练集等） | 仅用提供的 train + dev |
+| §2.7 | Notebook 必须能复现汇报结果 | 缓存到 Drive，全 cell 可重跑 |
+| §2.8 | 禁止上传 checkpoint / 数据 | `.gitignore` 排除 |
+| §2.9 | 报告 ACL 模板，正文 ≤ 7 页 | 按模板写 |
+| §2.10 | 必须使用官方 ipynb 模板 | `notebooks/notebook.ipynb` 在 3 个固定 section 下扩展 |
+
+**Plan-mode 阶段曾考虑租多卡服务器训练 9B**，因与 §2.3/§2.7 直接冲突已**放弃**。Qwen3.5-9B 仅作"int4 推理 ablation"，不作主模型。
+
+---
+
+## 3. 数据画像
+
+文件：`data/{train-claims,dev-claims,test-claims-unlabelled}.json` + `evidence.json`（174 MB，1,208,827 段）。
+
+| 数据 | 规模 | 备注 |
+|---|---|---|
+| train | 1,228 claims | 含 label + 1–5 条金标 evidence |
+| dev | 154 claims | 同上，**仅用于最终汇报指标，不参与训练 / 选型** |
+| test | 153 claims | 仅 claim_text，无 label / evidence |
+| evidence.json | 1.2M 段 | 中位 18 token / 106 字符；最长 479 token / 3148 字符 |
+
+**类别分布（不平衡）**：
+| label | train | dev | 比例 |
+|---|---|---|---|
+| SUPPORTS | 519 | 68 | 42% / 44% |
+| NOT_ENOUGH_INFO | 386 | 41 | 31% / 27% |
+| REFUTES | 199 | 27 | 16% / 17% |
+| DISPUTED | 124 | 18 | 10% / 12% |
+
+**金标证据数量** — 关键先验：
+| label | min | median | max | 备注 |
+|---|---|---|---|---|
+| SUPPORTS | 1 | 2 | 5 | |
+| REFUTES | 1 | 2 | 5 | |
+| **NOT_ENOUGH_INFO** | **5** | **5** | **5** | **始终恰好 5 条** ⚡ |
+| DISPUTED | 2 | 3 | 5 | |
+
+NEI 类金标恒为 5 条 → **直接驱动"标签条件 k"策略**（推理时若预测 NEI 则 k=5，否则 k=4）。
+
+完整 EDA 报告：`outputs/eda/eda_report.md`。
+
+---
+
+## 4. 系统总览
+
+```
+┌──────────────────── Stage 0: SFT 数据构造 (本地) ─────────────────────┐
+│  EDA → 三维打标 (scenario × domain × difficulty)                     │
+│       → hash 切分 (train_split / dev_holdout / diag_test)             │
+│       → 防泄漏断言 (六路 ∩ = ∅)                                       │
+│       → ms-swift 格式合成 + 硬负样本 + 课程排序                        │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               ▼
+┌──────────────────── Stage 1: Hybrid Retrieval (Colab) ───────────────┐
+│  BM25 (bm25s, top-200) + Dense (bge-m3, top-200)                     │
+│       → 加权融合 (0.3*bm25 + 0.7*dense, top-150)                     │
+│       → Cross-encoder rerank (bge-reranker-base, top-50)             │
+│       → Rule reorder (NER boost / 去重 / 多样性, top-20)              │
+│       → 标签条件 k (NEI=5, else=4)                                   │
+└─────────────────┬──────────────────────────┬─────────────────────────┘
+                  ▼                          │ HyDE 反哺
+┌──── Stage 2: Query Rewrite (Colab) ────┐  │
+│  synonym (WordNet) +                   │  │
+│  sub-claim split (LLM) +               │  │
+│  HyDE (LLM) → multi-query              ├──┘
+└─────────────────────┬──────────────────┘
+                      ▼
+┌──────────────────── Stage 3: SFT (Colab) ──────────────────────────────┐
+│  Qwen3.5-4B (VL)  ←  ModelScope                                       │
+│  ViT 冻结 (finetune_vision_layers=False)                              │
+│  LoRA (r=16, α=32) on all-linear (LM only)                            │
+│  QLoRA 4-bit, bf16, grad_checkpointing                                │
+│  ms-swift sft, 3 epoch, lr=2e-4, max_length=1024                      │
+│  prompt: "Claim ... [1] ev1 [2] ev2 ... → LABEL ##[1,3]##"           │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               ▼
+┌──────────────────── Stage 4: DPO (Colab) ──────────────────────────────┐
+│  推理 dev_holdout → 错预测构造 (chosen=gold, rejected=pred)           │
+│  + DISPUTED-vs-SUPPORTS 对抗对                                        │
+│  ms-swift rlhf --rlhf_type dpo, β=0.1, lr=5e-6, 1 epoch              │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               ▼
+┌──────────────────── Stage 5: 推理 (Colab) ─────────────────────────────┐
+│  自一致性: 5 samples @ T=0.7, top_p=0.9                              │
+│  Majority vote on label                                              │
+│  Max-confidence sample 的 evidences                                  │
+│  → outputs/dev-claims-predictions.json                               │
+│  → outputs/test-claims-predictions.json                              │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               ▼
+┌──────────────────── Stage 6: 评估 + 消融 + 归因 (本地) ────────────────┐
+│  9 路 ablation (A1-C2) → 主表 (官方 dev)                              │
+│  3 张诊断切片表 (domain × 8 / scenario × 7 / difficulty × 3)          │
+│  在 diag_test 上 → 错率最高的桶 = 数据-中心下一轮目标                  │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 5. Stage 0 — SFT 数据构造
+
+参考 `~/.claude/skills/llm-data-pipeline` 的 M1→M2→M3→M4 闭环结构，**精简到本任务必需的子集**。
+
+### 5.1 三维打标（scenario × domain × difficulty）
+
+**目的**：打标不只是为采样配比，更是**误差归因抓手**——按维度切片后能精确定位"哪一类问题在拖后腿"。
+
+#### A. Scenario（7 类，label-driven）
+
+| scenario | 判定规则 |
+|---|---|
+| supports_clear | label=SUPPORTS, n_ev ≤ 2 |
+| supports_aggregated | label=SUPPORTS, n_ev ≥ 3 |
+| refutes_clear | label=REFUTES, n_ev ≤ 2 |
+| refutes_aggregated | label=REFUTES, n_ev ≥ 3 |
+| nei_topic_off | NEI 但 evidence 与 claim 余弦低（embedding 阶段细化） |
+| nei_underspec | NEI 默认归此（heuristic） |
+| disputed_conflict | label=DISPUTED |
+
+#### B. Domain（8 类，关键词 + NER 启发式）
+
+| 代号 | 关键词样例 |
+|---|---|
+| temperature | warming, °C, hiatus, anomaly |
+| co2_atmospheric | CO2, ppm, emissions, GHG |
+| sea_level | sea level, ice sheet, glacier, Antarctica, Greenland |
+| extreme_weather | hurricane, flood, drought, wildfire |
+| paleoclimate | ice core, MWP, LIA, Holocene, proxy |
+| models_attribution | climate model, GCM, IPCC, RCP, attribution |
+| policy_economics | renewable, subsidy, carbon tax, Kyoto, Paris |
+| general_other | 兜底类 |
+
+**实测分布**（train 1,228 条）：
+- temperature 265 (22%) | co2 215 (18%) | sea_level 92 (7%) | models 53 | extreme 37 | policy 27 | paleo 20 | **general_other 519 (42%)** ← 启发式覆盖率不足，Colab 上将用 sentence-transformer 聚类细化
+- DISPUTED + paleoclimate + hard 这种交叉桶非常稀少，需要分层上采样
+
+#### C. Difficulty（3 级，三源加权）
+
+```
+score = 0.30 * length_norm + 0.25 * n_ev_norm + 0.45 * label_prior
+       (claim 越长 / 证据越多 / 标签越难 → 越接近 1)
+label_prior = {SUPPORTS:0.20, REFUTES:0.50, NEI:0.65, DISPUTED:0.85}
+
+level = easy if score < 0.40 else medium if score < 0.65 else hard
+```
+
+实测：SUPPORTS 0 hard / DISPUTED 0 easy → 课程学习有真实梯度信号。
+
+进阶版（Colab）：可叠加 `llm_judge`（zero-shot Qwen 给 0-1 分）和 `model_loss`（SFT 训练时该样本的 loss）。
+
+### 5.2 防泄漏切分（hash split + 6 路断言）
+
+```
+bucket = md5(salt || claim_id) % 10
+  0-7 → train_split   (~80%)
+  8   → dev_holdout   (~10%)  仅供 SFT early-stop + DPO 偏好对生成
+  9   → diag_test     (~10%)  完全保留；仅出现在诊断切片表
+```
+
+**实测**：986 / 121 / 121 / 154 (官方 dev)。
+
+**六路硬断言**（任一非空 → `RuntimeError` 终止）：
+```python
+assert train ∩ dev_holdout = ∅
+assert train ∩ diag_test = ∅
+assert dev_holdout ∩ diag_test = ∅
+assert train ∩ official_dev = ∅
+assert dev_holdout ∩ official_dev = ∅
+assert diag_test ∩ official_dev = ∅
+```
+
+`salt` 写死在 `src/splits.py`：哈希切分必须**确定性**，跨会话重跑要得到完全相同的分配。
+
+### 5.3 ms-swift SFT 数据组装
+
+每条 train_split claim → 一条 SFT 记录：
+
+```jsonc
+{
+  "id": "claim-2967",
+  "system": "You are a climate fact-checking expert. ...",
+  "query": "Output rules: 1. ...\nClaim: <text>\nEvidence:\n[1] <ev1>\n[2] <ev2>\n...\nAnswer:",
+  "response": "SUPPORTS ##[1,3]##",
+  "_meta": {"domain": "...", "scenario": "...", "difficulty": "easy",
+            "n_gold": 2, "n_shown": 5, "shown": ["evidence-N", ...]}
+}
+```
+
+**两种模式**：
+- `gold_only`（默认）：用 claim 自带的 gold evidences。简单但与推理分布不一致。
+- `retrieval`：把 claim 喂给检索器拿 top-k，再把 gold 强制塞进去（保住 SFT 信号）。**Colab 上启用此模式**。
+
+**硬负样本扩充**：每条 claim 配上 k 条**随机非 gold** 证据，重新打标 NEI → 训练 NEI/topic_off 信号。
+
+**课程排序**：每 epoch 内 `easy → medium → hard`，跨 epoch 重 shuffle 但保持坡度。
+
+**实测产出**：1972 records (1228 + 744 hard-neg)，0.1 秒构造（O(N) 优化前 376 秒）。
+
+### 5.4 数据质量门槛（M2 风格，4 维）
+
+| 维度 | 计算 | 用途 |
+|---|---|---|
+| factual_alignment | claim-evidence 句嵌入余弦 | 检测明显错配 |
+| evidence_sufficiency | sum(ev_tokens) / claim_tokens | 太短 / 太冗均扣分 |
+| label_confidence | 距类心距离 | 离群样本扣分 |
+| format_compliance | 是否能 parse 成 4 类之一 | 训练前校验 |
+
+**`_aggregate.action = drop` if 任一维 < 0.3** → 丢弃前打日志。
+
+> v1 实现（本地完成）只做 `format_compliance` 严格校验；其他三维需要 sentence-transformer，留待 Colab。
+
+---
+
+## 6. Stage 1 — Hybrid 检索
+
+参考 `swxy/swxy/backend/app/service/core/rag/nlp/{search_v2,query}.py` 的工业级设计。
+
+### 6.1 多路召回
+
+| 路 | 模型 / 库 | top | 显存 | 备注 |
+|---|---|---|---|---|
+| 稀疏 | `bm25s` | 200 | RAM ~1.5 GB | NumPy / SciPy 稀疏；不要用 `rank_bm25`（Python 纯解释，OOM） |
+| 稠密 | `BAAI/bge-m3` (568M, 1024d) | 200 | ~2 GB | 多语言；FAISS `IndexFlatIP` |
+| 备选 | `BAAI/bge-small-en-v1.5` (33M, 384d) | 200 | 0.3 GB | bge-m3 OOM 时退此 |
+
+**全语料 embedding 一次性 30–60 min**（Colab T4）。**必须缓存到 Drive**，分块 50k 段持久化避免 session 超时丢失。
+
+### 6.2 加权融合（vs swxy 0.05/0.95）
+
+```
+score = 0.3 * bm25_norm + 0.7 * dense_norm
+```
+
+为什么不是 swxy 的 0.05/0.95？气候 claim 含大量**实体 + 数值**（"1.5 °C", "ppm", "IPCC"），lexical 信号比通用问答更重要 → BM25 权重提到 0.3。两侧各自 min-max 归一化后求和。
+
+替代方案：RRF（Reciprocal Rank Fusion）`1/(60+rank)`，score-agnostic，更稳健。两者都实现，dev 上比较。
+
+### 6.3 Cross-encoder rerank
+
+`BAAI/bge-reranker-base` (278M)，对 (claim, candidate) pair 直接打分。Top-100 候选 reranking ~30 s on T4。
+
+**可选 LoRA 微调**：用 BM25 hard negatives 训 2 epoch 对比损失，dev 上看是否真有提升；不提升则**直接 zero-shot 出货**。
+
+### 6.4 规则重排
+
+参考 swxy `query.py:FulltextQueryer` 的实体加权 + 多样性思路：
+
+1. **NER 实体加权**：spaCy `en_core_web_sm` 抽 claim 实体；命中证据每加 1 个实体 +0.05 score（capped at 5×）
+2. **去重**：top-20 内任意两条 token-Jaccard > 0.85 → 删后者
+3. **多样性**：（可选）相同 source / topic 段落只保留 top-2
+
+### 6.5 标签条件 k
+
+```
+if predicted_label == "NOT_ENOUGH_INFO": k = 5    # NEI 金标恒为 5
+else: k = 4                                        # 其他类 median 2-3，k=4 最佳 F-score
+```
+
+但**预测标签**来自 Stage 5 推理，与 Stage 1 检索逆序依赖。两种实现：
+- **Two-pass**：第一次 k=5 推理拿标签，第二次按标签调 k 重新检索 + 重新推理。慢但准确。
+- **Threshold-based**：用 reranker 分数阈值 τ 替代固定 k（dev 上扫 τ）。一遍过。
+
+**默认走 threshold-based**；time permitting 跑 two-pass 作 ablation。
+
+---
+
+## 7. Stage 2 — Query 重写
+
+| 子模块 | 实现 | 触发时机 |
+|---|---|---|
+| 同义词扩展 | NLTK WordNet 单词替换（noun/verb，每词 ≤ 2 个变体） | 推理前 |
+| 子声明分解 | Qwen 零样本 prompt → 1-3 atomic sub-claims | claim 含"and/or"或长度 > 30 token |
+| HyDE | Qwen 零样本生成假设证据句 → embedding 与 claim embedding 加权 (α=0.6) | 推理前 |
+| 实体抽取 | spaCy `en_core_web_sm` | 给规则重排用 |
+
+**多查询融合**：每条变体单独 encode 后**取 top-K 候选 → RRF 融合**，最终再 rerank。
+
+> Stage 2 模块全部本地可单元测试（`tests/test_query_rewrite.py` 7 用例绿）。HyDE 实际生成需要 SFT 后的模型。
+
+---
+
+## 8. Stage 3 — SFT (Qwen3.5-4B QLoRA)
+
+### 8.1 框架对比 + 选择
+
+| 框架 | 优势 | 劣势 | 选择 |
+|---|---|---|---|
+| **ms-swift** | ModelScope/阿里官方，Qwen 系列原生适配，`--freeze_vit` 一行搞定，CLI + Python API | 文档以中文为主 | **主选** |
+| Unsloth | 2-5× 加速，显存省 70%，notebook 多 | VL 支持有滞后 | 备选（仅文本路径） |
+| TRL `SFTTrainer` | HF 官方最透明 | 显存优化弱，需自己写 freeze 逻辑 | 兜底 |
+| ~~LLaMA-Factory~~ | 仍维护中 | 同任务多 ~30% 显存 | 不选 |
+
+### 8.2 模型加载（ms-swift CLI）
+
+```bash
+swift sft \
+  --model "Qwen/Qwen3.5-4B-Instruct" \
+  --model_type qwen3_5_vl \
+  --use_hf false \                      # ModelScope，不走 HuggingFace
+  --train_type lora \
+  --target_modules all-linear \         # 仅 LM 线性层
+  --freeze_vit true \                   # ← 冻结视觉塔
+  --quantization_bit 4 \                # QLoRA
+  --bnb_4bit_compute_dtype bfloat16 \
+  --dataset outputs/sft_data/sft_train_v1.jsonl \
+  --val_dataset outputs/sft_data/sft_dev_holdout_v1.jsonl \
+  --output_dir /content/drive/MyDrive/sft-out \
+  --num_train_epochs 3 \
+  --per_device_train_batch_size 1 \
+  --gradient_accumulation_steps 16 \    # 等效 bs=16
+  --learning_rate 2e-4 \
+  --warmup_ratio 0.03 \
+  --max_length 1024 \
+  --gradient_checkpointing true \
+  --bf16 true \
+  --lora_rank 16 --lora_alpha 32 --lora_dropout 0.05 \
+  --save_steps 200 --eval_steps 200 \
+  --resume_from_checkpoint /content/drive/MyDrive/sft-out/last
+```
+
+### 8.3 显存预算（Colab T4 16 GB）
+
+| 组件 | 显存 |
+|---|---|
+| Qwen3.5-4B (4-bit base) | ~2.6 GB |
+| LoRA adapter + grads | ~0.5 GB |
+| Activations (seq 1024, bs=1) | ~6-8 GB |
+| Optimizer state (8-bit AdamW) | ~0.5 GB |
+| **总计** | **~10-12 GB（安全余量 4 GB）** |
+
+3 epochs × 1972 records ≈ 75-100 min on T4。每 200 step 存 LoRA adapter 到 Drive，避免 12h session 超时丢失。
+
+### 8.4 Prompt 设计（参考 swxy `chat.py` 的引用编号）
+
+```
+SYSTEM: You are a climate fact-checking expert. Given a claim and several
+        numbered evidence passages, decide whether the claim is SUPPORTED,
+        REFUTED, has NOT_ENOUGH_INFO, or is DISPUTED, based on the evidence.
+
+USER: Output rules:
+      1. Output exactly one label as the first token: SUPPORTS / REFUTES /
+         NOT_ENOUGH_INFO / DISPUTED.
+      2. After the label, list the evidence numbers you relied on, in the
+         form ##[1,3]##.
+      3. Do not output anything else.
+
+      Claim: {claim_text}
+      Evidence:
+      [1] {ev1}
+      [2] {ev2}
+      ...
+      Answer:
+
+ASSISTANT: SUPPORTS ##[1,3]##
+```
+
+**为什么是这个格式**：
+- Label 在最前 → first-token logit mask 可强约束（见 §10.3）
+- `##[..]##` 是稀有 token 序列，parser 容易 anchor
+- 数字索引 → SFT 训练时强制把 evidence index 与 evidence ID 解耦：模型学的是"基于第几条证据下判断"，evidence ID 在 prompt assembly 阶段定（每条 claim 不同）
+
+---
+
+## 9. Stage 4 — DPO 偏好对齐
+
+### 9.1 偏好对来源
+
+只用 `dev_holdout`（121 条），**绝不用官方 dev**：
+
+```python
+for cid in dev_holdout:
+    pred = sft_model(claim, retrieved)
+    if pred.label != gold[cid].label or set(pred.evidences) != set(gold[cid].evidences):
+        chosen   = build_target_response(gold.label, gold.ev, shown_ids)
+        rejected = build_target_response(pred.label, pred.ev, shown_ids)
+        emit_dpo_pair(claim, chosen, rejected)
+```
+
+### 9.2 对抗合成（DISPUTED-vs-SUPPORTS）
+
+DISPUTED 是最难 4 类——它要求模型识别"看似支持但其实存在争议"的微妙状态。从 `supports_clear` 样本随机抽 30 条，构造：
+- chosen = `SUPPORTS ##[1,...]##`（原 gold）
+- rejected = `DISPUTED ##[1]##`（人工对抗）
+
+教模型不要轻易跳到 DISPUTED。
+
+### 9.3 训练（ms-swift）
+
+```bash
+swift rlhf --rlhf_type dpo \
+  --model /content/drive/MyDrive/sft-out/checkpoint-best \
+  --train_type lora --quantization_bit 4 \
+  --dataset outputs/dpo_data/dpo_pairs.jsonl \
+  --beta 0.1 \                          # 经典 DPO
+  --learning_rate 5e-6 \
+  --num_train_epochs 1 \
+  --max_length 1024 --max_prompt_length 896 \
+  --per_device_train_batch_size 1 --gradient_accumulation_steps 16 \
+  --output_dir /content/drive/MyDrive/dpo-out \
+  --bf16 true
+```
+
+**显存技巧**：PEFT 的 `ref_model=None` 自动用"关闭 adapter 的同模型"作参考策略，省一份显存。
+
+`dpo_pairs.jsonl` schema：
+```jsonc
+{"system":"...","query":"...","response":"<chosen>","rejected_response":"<rejected>"}
+```
+
+---
+
+## 10. Stage 5 — 自一致性推理
+
+### 10.1 推理流程
+
+```python
+def predict(claim_text):
+    retrieved = pipeline.retrieve(claim_text)            # Stage 1+2
+    shown_ids = [eid for eid, _ in retrieved]
+    user_msg = build_user_query(claim_text, retrieved)
+
+    # 自一致性：5 次采样
+    labels, ev_lists = [], []
+    for _ in range(5):
+        out = model.generate(prompt, T=0.7, top_p=0.9, max_new=32)
+        lbl, evs = parse_response(out, shown_ids)
+        labels.append(lbl); ev_lists.append(evs)
+
+    # 多数投票
+    final_label = Counter(labels).most_common(1)[0][0]
+    # 在投出 final_label 的样本里选证据列表最长的（置信度代理）
+    best = max([i for i,l in enumerate(labels) if l == final_label],
+               key=lambda i: len(ev_lists[i]))
+    return {"claim_label": final_label, "evidences": ev_lists[best]}
+```
+
+预期增益：accuracy +2–3%，evidence F-score 持平或微涨。
+
+### 10.2 三种推理器（src/inference.py）
+
+| 类 | 用途 | 模型 | 解码 |
+|---|---|---|---|
+| `ModelInferer` | SFT/DPO 后的 B1-B3 ablation | 真模型 + tokenizer | 5 sample @ T=0.7 |
+| `ZeroShotInferer` | A1-A4（无 SFT）ablation | 真模型但 greedy | num_beams=1 |
+| `RetrievalOnlyInferer` | 检索 F-score 隔离测试 | 无 LLM；标签 = "SUPPORTS" / 随机 | — |
+
+### 10.3 约束解码（可选）
+
+约束首 token 在 4 个 label tokens 中：
+```python
+allowed = tokenizer.convert_tokens_to_ids(["SUPPORTS","REFUTES","NOT","DISPUTED"])
+def first_token_constraint(input_ids, scores):
+    if input_ids.shape[1] == prompt_len:  # 第一个生成 token
+        mask = torch.full_like(scores, float("-inf"))
+        mask[:, allowed] = scores[:, allowed]
+        return mask
+    return scores
+```
+
+实测先不加，看 SFT 后 label 自然分布；若出现非法 label > 1% 再开。
+
+### 10.4 鲁棒性
+
+`predict_all` 在单条 claim 异常时**降级到 NEI + dummy evidence** 而不是终止整批：
+- 保证最终 JSON 通过 `eval.py` schema 校验（labels valid + evidences 非空）
+- WARN log 单独记录，便于事后归因
+
+---
+
+## 11. Stage 6 — 评估、消融、误差归因
+
+### 11.1 三层指标
+
+1. **`score_predictions(preds, gold)`** —— 复刻 `eval.py:24-76` 的 F / A / HM 三指标，**与官方算法 1e-15 精度一致**（已固化为测试）。
+2. **`score_per_bucket(preds, gold, bucket_fn)`** —— 同算法但按桶分组。`bucket_fn` 是 `claim_id → str` 的任意映射，给三张诊断表用。
+3. **`recall_at_k(retrieved, gold, k)`** —— 检索-only 指标，用于 Stage 1 调参。
+
+### 11.2 9 路 ablation 配置
+
+| ID | 配置 | 想看什么 |
+|---|---|---|
+| A1 | BM25 + zero-shot Qwen3.5 | 最朴素 baseline |
+| A2 | + dense (bge-m3) | dense 召回贡献 |
+| A3 | + cross-encoder rerank | 重排贡献 |
+| A4 | + rule reorder + HyDE | RAG 工程化贡献 |
+| B1 | A4 + Qwen3.5 SFT | SFT 贡献 |
+| B2 | + DPO | 偏好对齐贡献 |
+| B3 | + self-consistency | 推理稳健性贡献（**flagship**） |
+| C1 | B3 inferred with Qwen3.5-9B int4 | 模型尺度敏感性（仅推理 ablation） |
+| C2 | B3 without curriculum | 课程贡献 |
+
+### 11.3 报告图表（6–9 个）
+
+1. retrieval recall@k 曲线（BM25 / +dense / +rerank / +rule）
+2. dev 上 k 扫描的 F-score 曲线
+3. 4 类混淆矩阵（突出 DISPUTED 混淆模式）
+4. ablation 主表（9 行 × {F/A/HM}）—— 在**官方 dev** 上算
+5. **每领域诊断切片表**（在 `diag_test`，8 domains × {F,A}）
+6. **每场景诊断切片表**（7 scenarios × A）
+7. **每难度诊断切片表**（3 levels × A）
+8. 课程开/关 loss 曲线
+9. （可选）DPO reward gap 曲线
+
+### 11.4 数据中心闭环（M5 风格）
+
+报告 Discussion 必写：
+1. 在 `diag_test` 上把每条错预测带 `(domain, scenario, difficulty)` 写到 `error_log.jsonl`
+2. `error_rate_per_bucket = errors / samples` 排序
+3. 前 3 个桶 → "下一轮迭代精确目标"
+4. 不必真的迭代 —— 把"识别 bucket X 是瓶颈，下一步会做 Y"写进报告就拿 novelty + analysis 分
+
+### 11.5 4-Track 边际增益分析（notebook §3.5）
+
+§11.2 的 9 路 ablation 是**完整消融矩阵**；4-track 是其中**最关键的 4 行**（A1 / A4 / B1 / B3）的"逐 cell 演进式"展示，每加一个组件就跑一遍指标。专为论文 Discussion 的"哪个组件贡献多少"设计。
+
+#### 配置矩阵
+
+| Track | 检索 | 模型 | 解码 | Inferer 类 | 期望 HM 增量 |
+|---|---|---|---|---|---|
+| 1. Base + prompt eng. | 无 | Qwen3.5-4B base | greedy | `NoRagInferer` | — (baseline) |
+| 2. Base + RAG | BM25+dense+rerank | Qwen3.5-4B base | greedy | `ZeroShotInferer` | +0.20 ~ +0.30 |
+| 3. SFT + RAG | 同 Track 2 | + SFT LoRA | greedy | `ZeroShotInferer(sft)` | +0.05 ~ +0.15 |
+| 4. SFT+DPO+RAG+SC | 同 Track 2 | + DPO LoRA | self-consistency 5 sample | `ModelInferer` | +0.01 ~ +0.03 |
+
+#### 关键设计决策
+
+- **共用 `pipeline_zero_shot`**：Track 2/3/4 检索条件完全一致 → SFT/DPO 增益可干净归因
+- **共用 `base_model`（4-bit）**：Track 1/2 共用一份模型副本，省 VRAM
+- **SFT/DPO 用 `PeftModel.from_pretrained(base, ckpt)`**：不重复加载基座
+- **SC 仅 Track 4 开启**：其他 track greedy → SFT→DPO delta 不被采样噪声干扰
+- **Track 1 evidence 是 stub** (`["evidence-0"]`) → F=0 by design，**只读 Label Acc** 作为参数知识基线
+- **缺 checkpoint 不报错**：`run_4tracks` / 各 track cell 自动 skip 缺失的 inferer，可只跑 Track 1+2 验证 RAG 链路
+
+#### Notebook §3.5 Cell 顺序（7 cell）
+
+```
+3.5a              load base model + 共享配置 (EVAL_N / eval_claims / PRED_DIR)
+3.5-track1        Base + prompt engineering          → track1_result
+3.5-track2        Base + RAG                         → track2_result   (Δ vs Track1)
+3.5-load-adapters load SFT / DPO LoRA (缺失 → skip)
+3.5-track3        SFT + RAG                          → track3_result   (Δ vs Track2)
+3.5-track4        SFT + DPO + RAG + Self-Consistency → track4_result   (Δ vs Track3)
+3.5-summary       聚合 → outputs/eval_compare.md + 终端表格
+```
+
+每个 track cell 跑完立即打印 `acc / F / HM / Δ HM / 时长`，**不等所有 track 跑完才出结果**。
+
+#### 输出物
+
+```
+outputs/predictions/track1_base.json
+outputs/predictions/track2_base_rag.json
+outputs/predictions/track3_sft.json
+outputs/predictions/track4_dpo.json
+outputs/eval_compare.md          # markdown 对比表带 Δ 列
+```
+
+每个 JSON 都通过 `eval.py` schema 校验，可单独丢给官方脚本复核。
+
+#### 运行规模开关
+
+3.5a cell 的 `EVAL_N` 是统一开关：
+- `EVAL_N = len(dev)` (154) → 最终汇报跑这个
+- `EVAL_N = 30` → 快速 smoke test（约 5× 提速），用于训练后立刻检查方向
+
+#### 健康判断（用于 Discussion 写作）
+
+| 现象 | 解读 | 行动 |
+|---|---|---|
+| Track 1 acc ≈ 0.25 | 模型 / parser 失效（≈ 4 类随机基线） | 检查 base 模型加载、tokenizer 配对 |
+| Track 2 F = 0 | RAG 检索没接通 | 回 §6 检查 `pipeline.retrieve(claim)` 输出 |
+| Track 2 acc < Track 1 acc | RAG 上下文挤压注意力 | 通常 SFT 后修正；先继续 |
+| Track 3 Δ HM < +0.02 | SFT 未学到任务格式 | 检查 epoch 数 / 学习率 / `sft_train_v1.jsonl` 格式 |
+| Track 4 Δ HM < +0.005 | DPO 偏好信号弱 | 检查 dpo_pairs.jsonl 错预测覆盖、β / 学习率 |
+
+---
+
+## 12. 代码组织
+
+仓库根目录：
+```
+.
+├── data/                    # 官方数据 (含 174 MB evidence.json，gitignore)
+├── eval.py                  # 官方评测脚本（只读，不改）
+├── notebooks/
+│   ├── notebook.ipynb                           # 主交付物
+│   └── GroupID__COMP90042_Project_2026.ipynb    # 官方模板存档
+├── src/                     # Python package
+│   ├── data_io.py           # 数据加载/写入
+│   ├── paths.py             # Colab vs 本地路径
+│   ├── eda.py               # EDA 报告生成
+│   ├── tagging.py           # scenario × domain × difficulty 启发式
+│   ├── splits.py            # hash 切分 + 防泄漏
+│   ├── stage0_tag.py        # tagging 入口
+│   ├── prompt.py            # SFT prompt 模板 + parser
+│   ├── sft_dataset.py       # ms-swift 格式构造 + 硬负样本 + 课程
+│   ├── query_rewrite.py     # 同义词 + 子声明 + HyDE
+│   ├── dpo_pairs.py         # DPO 偏好对构造
+│   ├── eval_helpers.py      # 复刻 eval.py + 切片
+│   ├── inference.py         # 自一致性推理 + 三种推理器
+│   ├── ablation.py          # 消融 harness + 报表渲染
+│   ├── build_stage0.py      # Stage 0 一键运行
+│   └── retrieval/
+│       ├── bm25.py          # bm25s 包装
+│       ├── dense.py         # bge-m3 + FAISS
+│       ├── fuse.py          # 加权 / RRF 融合
+│       ├── rerank.py        # cross-encoder + 规则重排
+│       └── pipeline.py      # 端到端编排
+├── tests/                   # 30+ 个本地单元测试，全绿
+│   ├── test_prompt.py       (8)
+│   ├── test_eval_helpers.py (3)  ← 复刻 eval.py 1e-15 精度
+│   ├── test_sft_dataset.py  (3)
+│   ├── test_fuse.py         (4)
+│   ├── test_query_rewrite.py(7)
+│   ├── test_dpo_pairs.py    (5)
+│   ├── test_inference.py    (4)
+│   └── test_ablation.py     (3)
+├── scripts/
+│   └── dry_run.py           # 上 Colab 前自检（exit 0 即可）
+├── outputs/                 # 全部 gitignore
+│   ├── eda/eda_report.md
+│   ├── sft_data/{claims_tagged,sft_train,sft_dev_holdout,sft_diag_test}_v1.jsonl
+│   ├── splits/{train_split,dev_holdout,diag_test,official_dev}.jsonl
+│   ├── PROGRESS.md          # 跨 session 进度日志
+│   └── dry_run_report.md    # 自检审计 trail
+├── design.md                # ← 本文件
+└── README.md                # 项目规范
+```
+
+**模块依赖原则**：
+- `paths.py` / `data_io.py` 是叶子节点，无外部依赖
+- 重型依赖（torch / sentence-transformers / bm25s）**惰性导入**到方法内 → 本地无 GPU 也能 import 整个 package
+- 测试只依赖 numpy / nltk / transformers，不需要 GPU 库
+
+---
+
+## 13. Notebook 组织 + 状态标记
+
+`notebooks/notebook.ipynb`（45 cells）port 进官方模板，3 个固定 section 标题保留：
+- `# 1.DataSet Processing` → 1.1 EDA / 1.2 三维打标 / 1.3 切分 / 1.4 SFT 数据
+- `# 2.Model Implementation` → 2.1 BM25 / 2.2 dense / 2.3 融合+重排 / 2.4 k-sweep / 2.5 SFT / 2.6 DPO / 2.7 推理
+- `# 3.Testing and Evaluation` → 3.1 scorer 校验 / 3.2 ablation / 3.3 诊断切片 / 3.4 测试预测
+- `## Object Oriented Programming codes here` → 重导入 `src/` 中的关键类
+
+**每个 sub-section header 带状态标记**：
+- ✅ verified locally —— 本地 dry-run 已跑过（Stage 0 全部 + 评估辅助）
+- 🧪 stub-validated locally —— 单测 + 合成数据已验证 wiring（消融 harness）
+- ⏳ requires Colab T4 —— 重计算（Stage 1 / 3 / 4 / 5 推理）
+
+完整审计 trail：`outputs/dry_run_report.md`。
+
+---
+
+## 14. 复现与提交
+
+### 14.1 三步复现
+
+1. 准备数据 + 模板：`data/evidence.json` + `notebooks/GroupID__COMP90042_Project_2026.ipynb`
+2. 本地：`python -m scripts.dry_run` → exit 0
+3. Colab：`notebook.ipynb` 全 cell run → 产出 `outputs/test-claims-predictions.json`
+
+### 14.2 提交清单
+
+| 文件 | 内容 | 备注 |
+|---|---|---|
+| `COMP90042_<team>.pdf` | ACL 报告，≤7 页正文 | 团队贡献 + references 不计页 |
+| `COMP90042_<team>_resource.zip` | notebook.ipynb + src/ + tests/ + scripts/ + design.md | **不**带 evidence.json / checkpoint / embeddings |
+
+### 14.3 复现性自检
+
+提交前 checklist：
+- [ ] `notebooks/notebook.ipynb` 全 cell **clear all output → restart → run all** 不报错
+- [ ] `python eval.py --predictions outputs/dev-claims-predictions.json --groundtruth data/dev-claims.json` 三个数与报告一致
+- [ ] zip 大小 < 50 MB（无大文件）
+- [ ] `python -m scripts.dry_run` exit 0
+- [ ] `for t in tests/test_*.py; do python -m tests.$(basename $t .py); done` 全绿
+
+---
+
+## 15. 测试矩阵
+
+| Suite | 用例数 | 覆盖模块 | 关键断言 |
+|---|---|---|---|
+| test_prompt | 8 | `prompt.py` | 模板生成 + parser 鲁棒性（含 garbage label / OOB index） |
+| **test_eval_helpers** | **3** | `eval_helpers.py` | **复刻 eval.py 至 1e-15 精度** |
+| test_sft_dataset | 3 | `sft_dataset.py` | 课程排序 / 硬负样本 / 标签格式 |
+| test_fuse | 4 | `retrieval/fuse.py` | 加权归一化 / RRF 一致性 |
+| test_query_rewrite | 7 | `query_rewrite.py` | WordNet 同义词 / 子声明 parse / HyDE prompt |
+| test_dpo_pairs | 5 | `dpo_pairs.py` | 错预测才出对 / DISPUTED 对抗合成 |
+| test_inference | 4 | `inference.py` | predict_all schema / 失败降级 |
+| test_ablation | 3 | `ablation.py` | 主表渲染 / flagship 切片 / 全报告写盘 |
+| **总计** | **37** | | **all green** |
+
+加上端到端 dry-run（`scripts/dry_run.py`），**全部本地代码自检 ~3 秒**。
+
+---
+
+## 16. 风险登记册
+
+| 风险 | 概率 | 影响 | 缓解 |
+|---|---|---|---|
+| Qwen3.5-4B HF/ModelScope ID 未公开 | 中 | 阻塞 SFT | 回退 `Qwen/Qwen2.5-VL-3B-Instruct`（同族同尺寸） |
+| Qwen3.5-4B QLoRA OOM | 中 | 训练不能跑 | seq_len 768；grad_accum 翻倍；ViT 完全置 None |
+| ms-swift 不支持目标 Qwen3.5-VL | 中 | 切训练框架 | 回退 Unsloth（仅 LM 路径，跳过视觉塔） |
+| DPO OOM | 中 | 损失新颖性 | β=0.1 + max_length=512；或砍 DPO |
+| bge-m3 全语料 embedding 太久 | 中 | 阻塞 retrieval | 退 `bge-small-en-v1.5`（30 min 内可完成） |
+| BM25 build OOM | 低 | retrieval 退化 | bm25s 已是 NumPy/SciPy 稀疏；分片建索引；或 Pyserini |
+| 9B int4 推理太慢 | 中 | C1 ablation 没跑 | 报告诚实说明算力受限 |
+| DISPUTED F1 ≈ 0 | 中 | 整体 accuracy | focal loss + 加大 hard 负采样 + DPO 对抗对手工增 |
+| Colab session 12h 超时 | 高 | 训练中断 | 每 200 step 存 LoRA adapter 到 Drive；resume_from_checkpoint |
+| 评分时无 GPU 重跑 | 高 | 评分员看不到结果 | notebook 缓存所有重计算结果到 markdown；`outputs/dry_run_report.md` 留 audit trail |
+
+**进度紧时砍的优先级**（从最先砍到最后砍）：
+1. Stage 4 DPO（保 SFT 即可拿大头分）
+2. Stage 1.5 HyDE（保留规则重排）
+3. Stage 0.4 课程学习（改成 random shuffle）
+4. Stage 5 自一致性（greedy 解码足够）
+
+---
+
+## 17. 设计决策记录
+
+按时序记录关键决策和"为什么不选别的"。
+
+### D-001：Hybrid RAG 而非纯 Transformer 分类
+- **决策**：retrieval + LLM 推理 hybrid，不用 DeBERTa-v3-base 直接做 4 分类
+- **替代**：纯分类器（曾在 plan v1 提过）
+- **理由**：(1) 规范明确"鼓励 hybrid 系统"；(2) 1228 训练样本对 base 模型够，但 evidence retrieval 是任务核心评测的一半，纯分类器需要单独检索器；(3) 一个 LLM 同时输出 label + evidence 索引更优雅，且 SFT 信号一致
+
+### D-002：模型选 Qwen3.5-4B 而非 9B
+- **决策**：4B QLoRA SFT 主线；9B 仅作 int4 推理 ablation
+- **替代**：9B 完整 SFT、租多卡服务器
+- **理由**：§2.3/§2.7 复现性约束 → 必须 Colab T4 跑通；4B QLoRA 显存预算 11–13 GB 安全；9B QLoRA 4-bit 仍要 18–22 GB
+
+### D-003：训练框架选 ms-swift
+- **决策**：SFT + DPO 都用 ms-swift
+- **替代**：Unsloth（更快但 VL 支持滞后）、LLaMA-Factory（多 30% 显存）、TRL（无 freeze_vit 一行）
+- **理由**：ModelScope 原生适配 Qwen 系列；`--freeze_vit true` 一行；CLI + Python API 双形态
+
+### D-004：融合权重 0.3/0.7（而非 swxy 的 0.05/0.95）
+- **决策**：`score = 0.3*bm25 + 0.7*dense`
+- **理由**：气候 claim 含大量实体 + 数值（1.5 °C / ppm / IPCC），lexical 信号比通用问答重要 → BM25 权重提升
+
+### D-005：标签条件 k = {NEI:5, else:4}
+- **决策**：推理时按预测标签调 final_k
+- **替代**：固定 k；reranker 阈值 τ
+- **理由**：EDA 发现 NEI 金标恒为 5。τ-based 也实现，作 ablation
+
+### D-006：诊断 hold-out 切分（diag_test）
+- **决策**：从 train 切 10% 作 `diag_test`，仅用于诊断切片表
+- **替代**：直接在官方 dev 上做切片
+- **理由**：dev 154 条 / 切到 8 个 domain × 3 个 difficulty = 每格 ≤ 5 条，统计噪声大；diag_test 121 条切片噪声同样大但**不污染汇报指标**
+
+### D-007：DPO 而非完整 RL
+- **决策**：SFT + DPO（无 reward model），不做 GSPO/PPO
+- **替代**：GSPO + group-wise sampling
+- **理由**：完整 RL 在 Colab 上风险大、收益不确定；DPO 一遍就出，且 ref_model=None 省显存
+
+### D-008：Hash 切分用 md5 而非 train_test_split
+- **决策**：`md5(salt || claim_id) % 10`
+- **替代**：sklearn `train_test_split(random_state=42)`
+- **理由**：跨 session 重跑需完全一致的分配；md5 + salt 给跨工具（Python / Bash / awk）一致结果
+
+### D-009：本地优先，Colab 兜底
+- **决策**：所有不依赖 GPU 的代码都在本地写完跑通，再上 Colab
+- **替代**：直接在 Colab 上写
+- **理由**：Colab session 12h 超时，频繁断连；本地 IDE 调试体验远好于 Colab；dry-run 在 ~3 秒内验证整条链路
+
+### D-010：源代码 + notebook 双交付
+- **决策**：notebook 仅作 orchestration，重逻辑在 `src/`；OOP section 重导入关键类
+- **替代**：所有代码都写在 notebook 里
+- **理由**：(1) `src/` 可单元测试；(2) notebook ≤45 cells 可读；(3) 评分员可单独看 `src/` 而非翻 notebook
+
+---
+
+## 18. 术语表
+
+| 术语 | 含义 |
+|---|---|
+| RAG | Retrieval-Augmented Generation |
+| BM25 | 经典稀疏检索算法（IDF + 词频） |
+| Dense retrieval | 基于句嵌入的稠密检索 |
+| Cross-encoder | 同时输入 (query, candidate) 做联合编码的 reranker |
+| RRF | Reciprocal Rank Fusion，`1/(60+rank)` 求和 |
+| HyDE | Hypothetical Document Embeddings，让 LLM 先写"假设证据"再去检索 |
+| QLoRA | 4-bit base + LoRA adapter，PEFT 显存友好方案 |
+| LoRA | Low-Rank Adaptation，往 attention/FFN 加低秩 adapter |
+| ViT | Vision Transformer，多模态模型的视觉塔 |
+| SFT | Supervised Fine-Tuning |
+| DPO | Direct Preference Optimization，无 reward model 的偏好对齐 |
+| RLHF | Reinforcement Learning from Human Feedback |
+| NLI | Natural Language Inference（蕴含/矛盾/中立） |
+| FEVER | Fact Extraction and VERification 数据集（**禁用**） |
+| diag_test | 我们从 train 切出的诊断 hold-out（121 条） |
+| dev_holdout | 我们从 train 切出的内部验证集（121 条），DPO 配对来源 |
+| official_dev | 官方 `data/dev-claims.json`（154 条），最终汇报用 |
+| 标签条件 k | 按预测标签动态调 retrieval top-k |
+| ms-swift | ModelScope SWIFT，阿里官方 LLM 训练框架 |
+
+---
+
+**文档版本**：v1.0（2026-04-30，session 3 收口）
+**作者**：Group _<fill in>_
+**关联文件**：
+- 完整方案（plan-mode 双语版）：`~/.claude/plans/fancy-mapping-lemur.md`
+- 进度日志：`outputs/PROGRESS.md`
+- 自检报告：`outputs/dry_run_report.md`
