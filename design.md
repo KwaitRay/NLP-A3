@@ -609,6 +609,24 @@ def first_token_constraint(input_ids, scores):
 2. **`score_per_bucket(preds, gold, bucket_fn)`** —— 同算法但按桶分组。`bucket_fn` 是 `claim_id → str` 的任意映射，给三张诊断表用。
 3. **`recall_at_k(retrieved, gold, k)`** —— 检索-only 指标，用于 Stage 1 调参。
 
+### 11.1b 评估驱动的迭代工作流（per D-015）
+
+执行顺序**不是** "Stage 0 → 3 → 6"，而是：
+
+```
+Phase 1  Track 1 + Track 2 评估（base + RAG, 当前 prompt）
+            ↓ per-bucket 诊断切片（domain × scenario × difficulty）
+Phase 2  Prompt 迭代（zero/few-shot, CoT, NEI 触发条件）
+            ↓ 每版重测 → 锁最优 prompt
+Phase 3  最优 prompt + RAG 重新评估
+            ↓ 识别仍弱的桶（acc < 0.3）
+Phase 4  SFT 数据按"弱桶倾斜"重新生成（调 sampler 权重，不改 build_sft_record 流水线）
+            ↓ Track 3 (SFT) 训练 + 评估
+Phase 5  对比扩充前后弱桶 acc，→ 决定是否进 DPO
+```
+
+每个 phase 之间产出的诊断切片表持久化到 `outputs/eval_phase{N}.md`，作为下一阶段决策依据 + 报告写作素材。
+
 ### 11.2 9 路 ablation 配置
 
 | ID | 配置 | 想看什么 |
@@ -914,6 +932,7 @@ outputs/eval_compare.md          # markdown 对比表带 Δ 列
 - **决策**：用 `Qwen/Qwen3.5-4B`（base），不用 `-Instruct`
 - **替代**：`Qwen/Qwen3.5-4B-Instruct`（**ModelScope 上不存在**）
 - **理由**：ModelScope 只放出了 base 版本。Track 1/2 (zero-shot) 表现因此偏弱，但**这反而让 Track 3 (SFT) 的 delta 更显著**，对论证 SFT 价值有利。Smoke test 实测：base 在 4-class 选择任务上能输出干净 label（对 SUPPORTS / REFUTES），但对 NEI 类倾向给 REFUTES（base 模型缺"我不知道"概念）。
+- **AutoDL 实测佐证（DISPUTED claim + 混合 evidence + SC 5×T=0.7）**：base 模型 5/5 都给 SUPPORTS，但其中 sample 5 的引用列表是 `##[1,2]##`（同时引用了支持 evidence 和反驳 evidence）。说明 base 模型**有"识别 evidence 相关性"能力，但缺"识别 evidence 矛盾 → 升级标签到 DISPUTED"能力**——正好是 `disputed_conflict` scenario + DPO 对抗对要教的核心技能。这条观察直接支撑"base 不够 + 必须 SFT/DPO"的论证。
 
 ### D-012：SFT/DPO 数据用 messages 标准格式（而非 query-response）
 - **决策**：record schema = `{messages: [{system}, {user}, {assistant}], _meta}`
@@ -931,6 +950,23 @@ outputs/eval_compare.md          # markdown 对比表带 Δ 列
 - **决策**：建一个独立脚本，不依赖 notebook、不依赖 RAG 索引，验证 model + prompt + parse 三件事
 - **替代**：所有验证都在 notebook cell 里做
 - **理由**：(1) 调通新硬件 / 新模型时，notebook 大量上下文初始化分散注意力；(2) 脚本 4 个 section（env / model load / tokenizer probe / inference 4a-4d）能在 5 分钟内回答"模型本身能不能跑、推理路径有没有兼容性问题、SC 在易题/难题上分别什么表现"；(3) 加 `--with-real-rag` 可选开关，索引就绪后还能验证完整 Track-2 路径，无需开 notebook
+
+### D-015：评估驱动、迭代式 SFT 数据扩充（方法论转向）
+- **决策**：先做透 Track 1/2 的评估 + prompt 优化，然后**用诊断切片表识别 base 模型最弱的桶**，再针对性扩充 SFT 数据。**不一上来就 SFT 全量训练**。
+- **替代（旧路线）**：按预设计划走 Stage 0 数据构造 → Stage 3 SFT 全量训练 → Stage 6 评估并归因。
+- **理由**：
+  1. **避免无效计算**：Smoke test 实测 base 模型已能输出干净的 `LABEL ##[..]##` 格式，所以 prompt 跟随能力不是瓶颈。瓶颈在**特定推理能力**（NEI 拒答、DISPUTED 矛盾识别）。如果不评估就 SFT，可能在 prompt 能修的部分浪费 LoRA 容量。
+  2. **数据设计有的放矢**：旧路线靠 scenario × domain × difficulty 三维**先验**配比（合理但盲目）。新路线用 Track 2 的 per-bucket 诊断表反向倒推哪些桶 acc 最低（**后验证据**），SFT 数据按这个倾斜配比 → 同样训练量、对最差桶的提升更大。
+  3. **报告叙事更强**：可以写"我们先充分压榨 prompt + RAG，识别出 base+RAG 在 X / Y 桶上 acc < 0.3 → 针对性合成 Z 条数据 → SFT 后这两桶提升到 0.6+"。这比"做了 SFT，整体 +5%"的论证强得多。
+- **新工作流**：
+  1. **评估 Phase 1**：完整跑 Track 1（base no-RAG）+ Track 2（base + RAG）on official dev + diag_test，产出**Track 2 的诊断切片表**（domain × scenario × difficulty）
+  2. **Prompt 优化 Phase**：迭代多版 prompt（zero-shot / few-shot / chain-of-thought / 显式 NEI 触发条件），每版重新 Track 1/2 评估，取最优
+  3. **评估 Phase 2**：用最优 prompt 重跑 Track 2 → 新诊断切片表 → **识别仍弱的桶**（典型预期：DISPUTED + NEI_topic_off + general_other 域）
+  4. **SFT 数据扩充**：针对最弱桶，加大 hard-negative / DISPUTED 对抗 / domain-specific 样本配比（仍用原 build_sft_record 流水线，只调 sampler 权重）
+  5. **SFT + 评估 Phase 3**：训练后再次诊断切片，**对比扩充前后的弱桶提升**
+- **不变的部分**：Stage 0/1/3/4/5/6 的代码骨架、检索策略、评测脚本都不需要改；变的只是**执行顺序**和**SFT 数据配比策略**。
+- **风险**：评估 + prompt 优化阶段会消耗一些 GPU 时间（推理 154 dev claims × N 个 prompt 变体），但相比 SFT 训练成本可忽略。
+- **关联**：D-011 的 DISPUTED 实测已经预示了这套流程的产出形态——base 模型对"识别证据矛盾"无能，正是评估阶段会显式量化、SFT 阶段定向修补的典型弱点。
 
 ---
 
