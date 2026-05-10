@@ -41,10 +41,16 @@ def load_dev_baseline() -> dict[str, dict]:
     return load_claims(DEV_BASELINE)
 
 
-def load_evidence(path: str | Path = EVIDENCE_JSON) -> dict[str, str]:
+def load_evidence(
+    path: str | Path = EVIDENCE_JSON,
+    *,
+    show_progress: bool = True,
+) -> dict[str, str]:
     """Load the full evidence corpus (~120k+ passages, ~174 MB).
 
-    Raises FileNotFoundError with a clear next-step hint if not yet downloaded.
+    With ``show_progress=True`` (default), wraps the file read in a tqdm
+    byte-level progress bar — useful on Colab/AutoDL where a ~30s blocking
+    json.load looks identical to a hung kernel.
     """
     p = Path(path)
     if not p.exists():
@@ -54,8 +60,28 @@ def load_evidence(path: str | Path = EVIDENCE_JSON) -> dict[str, str]:
             "  - https://canvas.lms.unimelb.edu.au/courses/234957/pages/evidence-dot-json-download\n"
             f"and place at {p}."
         )
-    with open(p, encoding="utf-8") as f:
-        return json.load(f)
+    if not show_progress:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+
+    size = p.stat().st_size
+    chunks: list[bytes] = []
+    with open(p, "rb") as f, tqdm(
+        total=size, unit="B", unit_scale=True, desc=f"loading {p.name}"
+    ) as bar:
+        while True:
+            chunk = f.read(8 * 1024 * 1024)  # 8 MB
+            if not chunk:
+                break
+            chunks.append(chunk)
+            bar.update(len(chunk))
+    return json.loads(b"".join(chunks).decode("utf-8"))
 
 
 def write_jsonl(records: Iterable[dict], path: str | Path) -> int:

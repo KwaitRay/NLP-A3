@@ -32,6 +32,25 @@ from .prompt import (
 )
 
 
+def _apply_template_to_device(tokenizer, msgs, device):
+    """Run apply_chat_template and return a 2-D tensor on `device`.
+
+    transformers 5.x returns a BatchEncoding (dict-like) from
+    apply_chat_template even with return_tensors="pt"; older versions
+    returned a bare tensor. Treating BatchEncoding as a tensor raises an
+    empty AttributeError when we hit `.shape` (BatchEncoding.__getattr__
+    proxies to self.data which has no 'shape' key). Normalize both forms
+    to a tensor so callers can keep using `.shape[1]` and `[0][n:]`.
+    """
+    import torch
+    encoded = tokenizer.apply_chat_template(
+        msgs, return_tensors="pt", add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    prompt_ids = encoded if torch.is_tensor(encoded) else encoded["input_ids"]
+    return prompt_ids.to(device)
+
+
 class _Retriever(Protocol):
     def retrieve(self, claim_text: str) -> list[tuple[str, str]]: ...
 
@@ -94,9 +113,7 @@ class ModelInferer:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user},
         ]
-        prompt_ids = self.tokenizer.apply_chat_template(
-            msgs, return_tensors="pt", add_generation_prompt=True
-        ).to(self.model.device)
+        prompt_ids = _apply_template_to_device(self.tokenizer, msgs, self.model.device)
 
         labels: list[str] = []
         ev_lists: list[list[str]] = []
@@ -176,9 +193,7 @@ class NoRagInferer:
             {"role": "system", "content": NO_RAG_SYSTEM_PROMPT},
             {"role": "user", "content": build_no_rag_query(claim_text)},
         ]
-        prompt_ids = self.tokenizer.apply_chat_template(
-            msgs, return_tensors="pt", add_generation_prompt=True
-        ).to(self.model.device)
+        prompt_ids = _apply_template_to_device(self.tokenizer, msgs, self.model.device)
         out = self.model.generate(
             prompt_ids,
             do_sample=False,
@@ -258,12 +273,21 @@ def predict_all(
                 yield x
         iterator = _bar(items)
 
+    import traceback as _tb
+    _err_traces_shown = 0
     for cid, claim in iterator:
         try:
             preds[cid] = inferer.predict(claim["claim_text"])
         except Exception as e:  # robust to per-claim failures during long runs
             preds[cid] = {"claim_label": "NOT_ENOUGH_INFO", "evidences": ["evidence-0"]}
-            print(f"  WARN {cid}: {e!r}")
+            # Print full traceback for the first 3 failures so silent
+            # errors (e.g. empty AttributeError) are diagnosable.
+            if _err_traces_shown < 3:
+                print(f"  WARN {cid}: {e!r}")
+                _tb.print_exc()
+                _err_traces_shown += 1
+            else:
+                print(f"  WARN {cid}: {e!r}")
 
     if out_path is not None:
         write_predictions(preds, out_path)
