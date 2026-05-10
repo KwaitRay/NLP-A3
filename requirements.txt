@@ -1,7 +1,7 @@
 # COMP90042 Assignment 3 — Hybrid RAG Climate Fact-Checker
 # ────────────────────────────────────────────────────────────
 # 在 conda env 里 pip 安装：
-#   conda create -n nlp_a3 python=3.10 -y
+#   conda create -n nlp_a3 python=3.12 -y
 #   conda activate nlp_a3
 #   pip install -r requirements.txt
 #   python -m spacy download en_core_web_sm
@@ -11,29 +11,32 @@
 #   pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 #
 # 注：torch / cuda 由 AutoDL 镜像预装，本文件不锁版本（避免覆盖镜像）。
-# 如本地无 GPU，单独装：pip install torch --index-url https://download.pytorch.org/whl/cpu
+# 推荐镜像：PyTorch 2.5.1 + CUDA 12.4 + Python 3.12（与本项目实测一致）。
+# 如本地无 GPU：pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-# ── 训练框架（Qwen3.5 SFT + DPO）─────────────────────────
-ms-swift>=3.0.0
-modelscope>=1.20.0
-transformers>=4.46.0,<4.50.0   # 4.50+ 引入 CVE-2025-32434 检查，要 torch≥2.6 才能加载 .bin 权重
-peft>=0.13.0
-trl>=0.12.0
+# ── 训练框架（Qwen3.5 SFT + DPO via ms-swift）────────────
+ms-swift>=3.0.0                # CLI 路径 swift/pipelines/train/sft.py，参数名见 design.md §8.6
+modelscope>=1.20.0             # Qwen3.5 模型来源（HuggingFace 上没 base 版本）
+transformers==5.2.*            # ← Qwen3.5 必需：5.1 缺模型类，5.3 视频 dataloader 坏（per qwen3.5_key_points.docx）
+qwen_vl_utils>=0.0.14          # ← Qwen3.5 是 mixed-thinking VL 模型，加载时即检查
+peft>=0.14.0                   # LoRA / QLoRA adapter
+trl>=0.12.0                    # ms-swift DPO 后端
 accelerate>=1.0.0
-bitsandbytes>=0.44.0           # QLoRA 4-bit 量化
+bitsandbytes>=0.45.0           # QLoRA 4-bit 量化（实测 0.49.2 on AutoDL）
+liger-kernel>=0.5.0            # ← fused MLP/RoPE kernel，SFT 时 --use_liger_kernel true 省 ~10-20% VRAM
 
 # ── 检索 ───────────────────────────────────────────────
 sentence-transformers>=3.0.0   # bge-m3 dense + bge-reranker-base
 bm25s>=0.2.0                   # 稀疏检索（不要用 rank_bm25，会 OOM）
 pystemmer>=2.2.0               # bm25s 词干处理
-faiss-cpu>=1.7.4               # 稠密索引；GPU 版本需要 conda 装 faiss-gpu
+faiss-cpu>=1.7.4               # 稠密索引；GPU 版需 conda install -c pytorch faiss-gpu
 
 # ── NLP 工具 ────────────────────────────────────────────
 spacy>=3.7.0                   # NER 实体抽取（rule reorder 用）
 nltk>=3.9.0                    # WordNet 同义词扩展
 
 # ── 数据处理 / 评测 ─────────────────────────────────────
-numpy>=1.24,<2.0               # transformers 还不兼容 numpy 2.x
+numpy>=1.24,<2.0               # transformers 5.x 兼容 numpy 1.26.x，2.0 仍有 import 警告
 scipy>=1.11.0
 scikit-learn>=1.3.0
 pandas>=2.0.0
@@ -43,3 +46,28 @@ tqdm>=4.66.0
 jupyter>=1.0.0
 ipykernel>=6.25.0
 ipywidgets>=8.0.0              # tqdm 进度条 + transformers 显示
+
+# ──────────────────────────────────────────────────────────
+# 可选加速（不在 pip install -r 自动装；按需手动）
+# ──────────────────────────────────────────────────────────
+#
+# 1. flash-linear-attention（Qwen3.5 GatedDeltaNet 的 fast path）
+#    没装时 transformers 自动 fall back 到 torch 实现，能跑但慢 ~30%。
+#    需要 PyTorch ≥ 2.4 + matching CUDA：
+#      pip install -U "flash-linear-attention>=0.4.2" --no-build-isolation
+#
+# 2. causal-conv1d（fla 的配套 kernel）
+#    与 fla 一起开启 GatedDeltaNet 全速。从 git 装会触发 nvcc 编译，
+#    要求 torch 编译时的 CUDA 版本与系统 CUDA toolkit 一致：
+#      pip install -U "git+https://github.com/Dao-AILab/causal-conv1d" --no-build-isolation
+#    AutoDL 镜像 PyTorch 2.5.1+cu124 + CUDA 12.4 toolkit 实测可编译；
+#    cu130 等不匹配镜像会失败（详见 debug_log.md 问题 13）。
+#
+# 3. flash-attn 2.x（标准 self-attention 加速）
+#    **不要在 T4/V100 等 Turing 架构上装**：要求 SM ≥ 8.0 (Ampere+)。
+#    Ampere+ 上可选装：
+#      pip install "flash-attn>=2.6,<3.0" --no-build-isolation
+#    本项目不依赖：transformers 默认 sdpa attention 在 Turing/Ampere 上都工作良好。
+#
+# 4. deepspeed（多卡 ZeRO，与本项目 single-GPU 设定无关）
+#      pip install deepspeed
