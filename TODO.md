@@ -3,7 +3,7 @@
 > 单页"明天打开就知道做什么"的快速恢复文档。
 > 完整计划见 `optimization_plan.md`，本文只列**接下来一步要做什么**。
 >
-> 最后更新: 2026-05-11 深夜（Phase 1 跑通，数字异常待诊断）
+> 最后更新: 2026-05-12（Phase 1+2 done, 检索天花板发现 → Phase 3.5 优化）
 
 ---
 
@@ -23,10 +23,14 @@
 - [x] **本地 4 个模型权重全部下载完成**（`models/` 下 ~11 GB）
 - [x] **本地 BM25 索引建好**（`outputs/bm25_index/bm25/` 5 个文件，~200 MB）→ 本地 retrieval 现在可 dry-run
 - [x] **AutoDL dense 索引建好**（`outputs/dense_index/`, 9.2 GB）+ safetensors 转换 + messages 格式 SFT 数据全部就位
-- [x] **Phase 1 baseline 第一次评估跑通**（Track 1+2 × v1 on diag_test，~4.5 min on 4080 SUPER）
-  - Track 1 (no-RAG, greedy):  F=0.0000  Acc=0.3223  HM=0.0000
-  - Track 2 (RAG, greedy):     F=0.1169  Acc=0.4215  HM=0.1830
-  - ⚠️ Track 1 Acc=0.3223 ≈ NEI 占比 0.3306 → 触发诊断（见下方 Step 2.5）
+- [x] **Phase 1 baseline 评估跑通 + 诊断完成**
+  - Track 2 v1: F=0.1169 Acc=0.4215 HM=**0.1830**（生产基线）
+  - per-label acc: S 0.526 / R 0.500 / NEI 0.350 / DISPUTED 0.286
+  - base 模型 Track 1 NEI acc=0.025 / DISPUTED acc=0.000 → 量化证实 §0.5.2 4a
+- [x] **Phase 2 prompt sweep 完成**：v1 锁定。v2/v3/v4 全部回退（v3 REFUTES→0）
+- [x] **关键发现：检索天花板 evidence recall ≈ 0.11**（v1-v4 全部一样，与 prompt 无关）
+  - F-score 当前架构硬上限 ≈ 0.12，HM 硬上限 ≈ 0.21
+  - **SFT 之前必须先做 Phase 3.5 检索优化**（见下方 Step 4）
 
 ---
 
@@ -47,54 +51,54 @@ python -m scripts.phase1_eval --tracks 1,2 --prompts v1 --dataset diag_test
 - `outputs/eval_phase1/track2_v1_diag_test.{json,md}` — F=0.1169, Acc=0.4215, HM=0.1830
 - `outputs/eval_phase1/summary_diag_test.md`
 
-### ⚠️ Step 2.5 — 诊断 Track 1 Acc ≈ NEI 占比 的异常（**新增，明天第一步**）
+### ✅ Step 2.5 — Phase 1 诊断 (已完成)
 
-Track 1 Acc=0.3223 = 39/121 离"全猜 NEI 多数类"的 40/121 只差 1 条。
-两种可能（见 `debug_log.md` 问题 17）：
+`diagnose_phase1.py` 已确认：非 parser fallback；问题是 base 模型完全缺 NEI/DISPUTED 概念，
+RAG 部分补救。详见 `outputs/eval_phase1/diagnose_diag_test.md`。
 
-- (a) Parser fallback 全走 NEI → 改 prompt v2 / parser
-- (b) 模型真在判别只是偏弱 → 进 Phase 2 / Phase 4
+### ✅ Step 3 — Phase 2 prompt sweep (已完成)
 
-**先跑诊断脚本**（< 5 s，纯分析 saved JSON，无 GPU）：
+v1 锁定。`summary_diag_test.md` 含完整 v1-v4 对比。v2/v3/v4 全部回退。
 
-```bash
-python -m scripts.diagnose_phase1 --dataset diag_test
-```
+### 🎯 Step 4 — Phase 3.5 检索天花板审计 (**明天第一步**)
 
-产出：`outputs/eval_phase1/diagnose_diag_test.md`。看：
-- **非-NEI acc** 列：接近 0 → (a) 确认；显著大于 0 → (b)
-- **predicted NEI 占比**：> 50% 且自动 flag ⚠️ → (a) 确认
-- **confusion matrix**：对角线有信号则 (b)；列塌缩到 NEI 那一列则 (a)
-
-**走向 (a) 时**：跑 `scripts.test_qwen35_inference` 重生成几条 diag_test 实例，打印 raw output 看具体输出。然后改 prompt v2 或 `parse_response` 容错。
-**走向 (b) 时**：直接进 Step 3 跑 Phase 2 prompt sweep。
-
-### Step 3 — AutoDL：Phase 2 prompt 扫描（v2/v3/v4, ~15 min）
-
-> **前置条件**：Step 2.5 诊断已确定走 (b) 路径（模型真在判别），或走 (a)
-> 修复完成。否则 v2/v3/v4 在 broken pipeline 上跑没意义。
+> **为什么先做这个**：evidence recall ≈ 0.11 → F-score 当前架构硬上限 ≈ 0.12。
+> Phase 4 SFT 哪怕把 label 提到 100% 正确，HM 也只能到 ≈ 0.21。先把检索拉起来，
+> SFT 红利才能兑现。详见 `optimization_plan.md` §3.5。
 
 ```bash
-python -m scripts.phase1_eval \
-    --tracks 2 --prompts v2,v3,v4 --dataset diag_test
+# AutoDL 上 — 全模式扫描，~3 min（纯检索，无 LLM）
+python -m scripts.retrieval_ceiling --dataset diag_test --mode all
+
+# 看产出
+cat outputs/eval_phase1/retrieval_ceiling_diag_test.md
 ```
 
-`summary_diag_test.md` 会被覆盖成包含 v1-v4 的对比，看哪个 prompt 在 Track 2 上 HM 最高 → 锁定。
-**Track 2 v1 HM=0.1830 是新基线**，v2/v3/v4 必须显著高才有意义。
+四个 mode 会跑：
+- **final_k**：5→10→20→50→100 看 recall 曲线（最可能的快速胜：现在 `final_k=5` 太紧）
+- **retriever**：BM25-only / dense-only / fused / +rerank 看哪个组件贡献最大
+- **fusion_w**：w_bm25 ∈ {0.1, 0.3, 0.5, 0.7, 0.9}（当前 0.3 偏 dense）
+- **synonym_expand**：claim vs claim + WordNet 同义词 multi-query union
 
-也可以顺手把 v2/v3/v4 也跑一遍 Track 1，看 Step 2.5 诊断的 (a) 假设是否能被 prompt v2 直接修掉：
+读 `retrieval_ceiling_diag_test.md` 的 "Best Overall" 段，把最佳配置写回
+`optimization_plan.md` §10 决策日志 + `RetrievalConfig` 调用处。
+
+### Step 5 — 用新检索配置重建 SFT 数据 + 跑 Phase 4
+
 ```bash
-python -m scripts.phase1_eval --tracks 1 --prompts v2,v3,v4 --dataset diag_test
-python -m scripts.diagnose_phase1 --dataset diag_test  # 自动覆盖所有新 run
+# 备份当前 v1 数据
+cp -r outputs/sft_data outputs/sft_data.v1_backup
+
+# 在 src/retrieval/pipeline.py 改默认 RetrievalConfig，或者
+# 在 src/sft_dataset.py 用 RetrievalConfig 重建
+python -m src.build_stage0 --force  # 重生成 sft_train_v2.jsonl
 ```
 
-### Step 4 — 把决策填到 `optimization_plan.md` §10
+之后再走 Phase 4 弱桶配比（见 `optimization_plan.md` §4）。
 
-在决策日志表追加：
-```markdown
-| 2026-05-12 | Phase 1 diagnosed | (a) parser fallback 或 (b) 模型偏弱 — 实际为 ?? | diagnose_diag_test.md |
-| 2026-05-12 | Phase 2 done | 锁定 prompt: v?  Track 2 HM 从 0.1830 → ? | summary_diag_test.md |
-```
+### Step 6 — Phase 5 训练 + 评估（不变）
+
+详见 `optimization_plan.md` §5。
 
 ---
 
@@ -157,4 +161,4 @@ python -m scripts.build_indexes
 
 ---
 
-**下次 session 第一句话**：在 AutoDL 上跑 `python -m scripts.diagnose_phase1 --dataset diag_test`，把 `outputs/eval_phase1/diagnose_diag_test.md` 的 cross-run summary 表 + Track 1 confusion matrix 贴回来。
+**下次 session 第一句话**：在 AutoDL 上跑 `python -m scripts.retrieval_ceiling --dataset diag_test --mode all`，把 `outputs/eval_phase1/retrieval_ceiling_diag_test.md` 的 "Best Overall" + recall@k 曲线表贴回来。

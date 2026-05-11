@@ -220,6 +220,89 @@ If Phase 2 already produced track2_<best>_diag_test.md, **skip — reuse it**.
 
 ---
 
+## 3.5. Phase 3.5 — 检索天花板审计 / Retrieval Ceiling Audit
+
+> **新增于 2026-05-12**：Phase 2 prompt sweep 后用 `diagnose_phase1.py`
+> 发现 Track 2 v1-v4 **evidence recall 全部锁在 0.10 附近**（macro 0.10-0.11,
+> micro 0.09-0.10）。F-score 的天花板由检索决定，与 prompt / SFT 无关。
+> 若 retrieval recall=0.11，即使 label 100% 正确也只能拿到 F ≈ 0.12, HM ≈ 0.21。
+> 在花 GPU-hour 做 SFT 之前必须先排查检索瓶颈。
+>
+> **Added 2026-05-12**: post-Phase-2 diagnosis showed evidence recall is
+> locked at ~0.11 across all four prompt variants — the F-score ceiling
+> is bound by retrieval, not by label classification. Even with perfect
+> labels we cap at HM ≈ 0.21. Must audit retrieval before spending
+> GPU-hours on SFT.
+
+### 3.5.1 目的 / Purpose
+
+定位检索瓶颈：是 (i) `final_k=5` 太紧、(ii) BM25/dense 融合权重错、
+(iii) 单一 query 表征不足，还是 (iv) 检索器本身能力不够。每一项的修
+复成本和上限不同，必须分别量化。
+
+Locate the retrieval bottleneck: (i) `final_k=5` too tight, (ii)
+fusion weights miscalibrated, (iii) single-query representation
+insufficient, or (iv) retriever capacity ceiling. Each has different
+fix cost; quantify them separately.
+
+### 3.5.2 实验设计 / Experiments
+
+实现在 `scripts/retrieval_ceiling.py`（无 LLM、纯检索 + recall@k 测量，
+~3 min on AutoDL 4080 SUPER）。
+
+Implemented as `scripts/retrieval_ceiling.py` (no LLM, retrieval-only +
+recall@k measurement, ~3 min on AutoDL).
+
+| 模式 / Mode | 调节维度 / Knob | 假设 / Hypothesis |
+|---|---|---|
+| `final_k` | 5 → 10 → 20 → 50 → 100 | 当前 5 太紧；扩到 20 可能让 recall 翻倍 |
+| `retriever` | BM25-only / dense-only / fused / +rerank | 看哪个组件贡献最大 |
+| `fusion_w` | w_bm25 ∈ {0.1, 0.3, 0.5, 0.7, 0.9} | 当前 0.3/0.7 偏 dense，可能 BM25 多给点效果好（claim 文本里关键词更具区分度） |
+| `synonym_expand` | 单 query vs claim + WordNet 同义词 | `src/query_rewrite.synonym_expand` 已实现，多 query union 可能在词面差异大的 claim 上拉 recall |
+
+### 3.5.3 评估指标 / Metrics
+
+- **macro evidence recall@k**：每条 claim 算一次 `|pred ∩ gold| / |gold|`，对全部 claim 取均值
+- **micro evidence recall@k**：所有 claim 的 hit 总数 / gold 总数
+- **per-label recall**：分别按 SUPPORTS / REFUTES / NEI / DISPUTED gold label 看 recall（NEI 有 5 gold，其他 1-3，分开看）
+- **recall@k 曲线**：k 从 5 到 100，看是否在某个 k 处饱和
+
+### 3.5.4 决策准则 / Decision criteria
+
+| 现象 / Observation | 含义 / Meaning | 行动 / Action |
+|---|---|---|
+| recall@100 仍 < 0.30 | 检索器本身就不行 | 严重：考虑加 query rewrite (HyDE/sub-claim, 需 LLM) 或换 ColBERT |
+| recall@5 = 0.11 但 recall@20 = 0.35 | `final_k` 太紧 | 加 `--final-k` CLI flag 到 `phase1_eval`，重测 |
+| BM25-only recall ≫ dense-only | 当前 0.3/0.7 fusion 偏错 | 调到 0.6/0.4 或更高 BM25 权重 |
+| synonym expand 提升 ≥ +0.05 recall | 词面表征不足是瓶颈 | 把 multi-query 接进 `RetrievalPipeline` |
+| 上面都不行 | LLM-driven 重写（HyDE / sub-claim）值得试 | Phase 3.5b：上 Qwen 跑 HyDE/sub-claim 重写 |
+
+### 3.5.5 执行 / Execute
+
+```bash
+# AutoDL，~3 min
+python -m scripts.retrieval_ceiling --dataset diag_test --mode all
+
+# 单独跑某一项
+python -m scripts.retrieval_ceiling --dataset diag_test --mode final_k
+python -m scripts.retrieval_ceiling --dataset diag_test --mode synonym_expand
+```
+
+### 3.5.6 产出 / Output
+
+- `outputs/eval_phase1/retrieval_ceiling_<dataset>.md` — 全模式对比表 + 最佳配置 callout
+- 决策日志填回本文件 §10，把锁定的 `RetrievalConfig` 写进 `optimization_plan.md` 供 Phase 4 SFT 数据重新构造时使用（SFT 数据里的 retrieved evidence 必须用最终的检索配置生成，否则 train/inference 不一致）
+
+### 3.5.7 风险 / Risks
+
+| 风险 / Risk | 缓解 / Mitigation |
+|---|---|
+| 改了 `final_k` 后 prompt context 长度增加 → 推理慢 / OOM | `final_k=20` 时 evidence 拼起来 ~2000 tokens，4080 SUPER 4-bit Qwen3.5-4B 还远没到 OOM，再大才要降级 |
+| Phase 4 SFT 数据要按新检索配置重建 | `python -m src.build_stage0 --force` 重跑 ~5 s，但 `outputs/sft_data/sft_train_v1.jsonl` 会被覆盖，先备份 |
+| BM25/dense recall@100 都低 → 真要 LLM rewrite | HyDE/sub-claim 用 base Qwen3.5-4B 已经够好，加 ~5 min inference cost 但能跨语义鸿沟 |
+
+---
+
 ## 4. Phase 4 — 弱桶定位 + SFT 数据扩充 / Weak-bucket Targeting
 
 ### 4.1 目的 / Purpose
@@ -448,18 +531,25 @@ AutoDL boxes; submission zip carries only small artifacts.
 - [x] `scripts/convert_bin_to_safetensors.py`（应对 ModelScope 缺 safetensors + transformers CVE-2025-32434）
 - [x] AutoDL 上 dense 索引建好（9.2 GB）+ Phase 1 第一次评估跑通（Track 1+2 × v1 on diag_test）
 - [x] `scripts/diagnose_phase1.py`（应对 Phase 1 数字异常 — 见 debug_log 问题 17）
+- [x] **Phase 1 诊断完成**：base 模型 NEI acc=0.025 / DISPUTED acc=0.000（量化证实 §0.5.2 4a）；
+      非 parser fallback。Track 2 v1 per-label acc: SUPPORTS 0.526 / REFUTES 0.500 /
+      NEI 0.350 / DISPUTED 0.286。
+- [x] **Phase 2 prompt sweep 完成**：v1 (HM=0.1830) 锁定为生产 prompt。v2 NEI 指令拉起 NEI acc
+      +20pp 但 over-correct 偷 REFUTES (−27pp)；v3 DISPUTED 指令把 REFUTES 干到 0；v4 few-shot
+      未能修 v3 的问题。验证 §0.5.3 硬约束 1+3（NEI/DISPUTED 是能力问题，prompt 教不会）。
+- [x] **检索天花板发现（关键）**：Track 2 v1-v4 evidence recall 全部 ≈ 0.11，与 prompt 无关。
+      F-score 当前架构硬上限 ≈ 0.12，HM ≈ 0.21。在 SFT 之前必须先做 Phase 3.5。
 
 ### 进行中 / In progress
-- [ ] **Phase 1 结果诊断 / Phase 1 result diagnosis**：Track 1 Acc=0.3223 ≈ NEI 占比 0.3306，
-      需 `diagnose_phase1.py` 区分 (a) parser fallback 全 NEI vs (b) 模型真有判别但偏弱。
-      *Track 1 Acc looks identical to NEI fraction; need diagnostic to distinguish
-      (a) parser fallback vs (b) genuine bias before deciding next move.*
+- [ ] **Phase 3.5 检索天花板审计 / Retrieval ceiling audit**：跑 `scripts.retrieval_ceiling`
+      四个 mode（final_k / retriever / fusion_w / synonym_expand），找出 recall 瓶颈
+      和最佳 `RetrievalConfig`。
+      *Run `scripts.retrieval_ceiling` across 4 modes; locate recall bottleneck +
+      lock best `RetrievalConfig` before Phase 4 SFT data regen.*
 
 ### 待做 / Todo
-- [ ] 根据诊断结果走 (a) prompt/parser 修复 或 (b) 直接进 Phase 2 / 4
-      *(a) prompt v2 / parser fix or (b) proceed to Phase 2 / 4 — branches on diagnosis*
-- [ ] Phase 2 prompt 变体扫描（v2-v4 on diag_test）
-- [ ] Phase 3-4：弱桶定位 + 给 `build_dataset` 加 `weak_buckets` 参数
+- [ ] 用锁定 `RetrievalConfig` 重建 SFT 数据 (`python -m src.build_stage0 --force`)
+- [ ] Phase 4：弱桶定位 + 给 `build_dataset` 加 `weak_buckets` 参数（用 Track 2 v1 per-bucket 表）
 - [ ] Phase 5：SFT v2 训练 + DPO 训练 + 4-track 评估
 - [ ] Phase 6：official dev 终评 + test 集预测 + 报告
 
@@ -473,7 +563,10 @@ AutoDL boxes; submission zip carries only small artifacts.
 |---|---|---|---|
 | 2026-05-11 | (pre-Phase 1) | smoke test 显示 base 模型能输出 `LABEL ##[..]##` 干净格式，5/5 SC 同票 (SUPPORTS) 但 sample 5 同时引 ev-pro 和 ev-con → base 缺"识别证据矛盾"能力 | `materials/qwen3.5_key_points.docx` + AutoDL smoke test logs |
 | 2026-05-11 | Phase 1 (raw) | Track 1 v1 F=0.0000 Acc=0.3223 HM=0.0000；Track 2 v1 F=0.1169 Acc=0.4215 HM=0.1830。Track 1 Acc 几乎=NEI 占比 0.3306 → 触发 NEI-default 诊断（debug_log 问题 17 + diagnose_phase1.py） | `outputs/eval_phase1/summary_diag_test.md` |
-| TBD | Phase 1 diagnosed | (a) parser fallback vs (b) 模型真偏弱 — 取决于 `diagnose_phase1.py` 报告 | `outputs/eval_phase1/diagnose_diag_test.md` |
+| 2026-05-12 | Phase 1 diagnosed | 非 parser fallback。Track 1 NEI acc=0.025 / DISPUTED acc=0.000（base 模型缺这两类能力，量化重复 §0.5.2 4a）。Track 2 v1 per-label: S 0.526 / R 0.500 / NEI 0.350 / D 0.286 — RAG 补了 NEI/DISPUTED 但磨钝 S/R。 | `outputs/eval_phase1/diagnose_diag_test.md` |
+| 2026-05-12 | Phase 2 done | 锁定 prompt **v1 baseline**（HM=0.1830）。v2 NEI 指令 over-correct 偷 REFUTES (−27pp)；v3 DISPUTED 把 REFUTES 干到 0；v4 few-shot 未修。验证 §0.5.3 硬约束 1+3。 | `outputs/eval_phase1/summary_diag_test.md` |
+| 2026-05-12 | 检索天花板发现 / Retrieval ceiling found | Track 2 v1-v4 evidence recall 全部 ≈ 0.11（与 prompt 无关）→ F-score 当前架构硬上限 ≈ 0.12, HM ≈ 0.21。SFT 之前必须先做 Phase 3.5。 | `outputs/eval_phase1/diagnose_diag_test.md` |
+| TBD | Phase 3.5 done | 锁定 `RetrievalConfig`: final_k=?, w_bm25=?, query rewrite=? Recall@k 提升 +? | `outputs/eval_phase1/retrieval_ceiling_diag_test.md` |
 | TBD | Phase 2 done | 锁定 prompt: v?  Track 2 HM 提升 +? | `outputs/eval_phase1/summary_diag_test.md` |
 | TBD | Phase 4 done | weak_buckets 配比: {...} → sft_train_v2.jsonl | `outputs/sft_data/sft_train_v2_meta.json` |
 | TBD | Phase 5 done | SFT/DPO HM = ?, 最弱桶提升: ... | Phase 5 eval reports |

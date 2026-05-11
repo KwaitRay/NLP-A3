@@ -2,6 +2,55 @@
 
 > Live status tracker. Update when crossing milestones. Plan in `~/.claude/plans/fancy-mapping-lemur.md`.
 
+## 2026-05-12 — Session 9 (Phase 1 diagnosed + Phase 2 prompt sweep + retrieval ceiling discovered)
+
+Three major findings in one session; the third reshapes the rest of the plan.
+
+- **Phase 1 diagnosis closed (debug_log Issue 17)**. `diagnose_phase1.py`
+  on `track{1,2}_v1_diag_test.json` ruled out the parser-fallback
+  hypothesis. Track 1 confusion matrix shows the base model is
+  actively classifying (SUPPORTS acc 0.658, REFUTES 0.591) but has
+  ~zero capability on NEI (1/40 = 0.025) and DISPUTED (0/21 = 0.000).
+  Track 1 Acc=0.3223 ≈ NEI gold fraction 0.3306 was a coincidence:
+  the model nearly always picks SUPPORTS or REFUTES, accidentally
+  matching 1 gold NEI claim. Track 2 (RAG) recovers NEI to 0.350 and
+  DISPUTED to 0.286, at the cost of SUPPORTS (0.526) and REFUTES
+  (0.500) which RAG mildly distracts. This is a **quantified replay
+  of `optimization_plan.md §0.5.2 4a`** at n=121.
+- **Phase 2 prompt sweep complete; v1 locked**. Ran v2/v3/v4 on Track 2:
+  - v1 baseline: F=0.1169 Acc=0.4215 **HM=0.1830** (winner)
+  - v2 nei_explicit: F=0.1087 Acc=0.4132 HM=0.1722. NEI rule fires
+    (NEI predicted 25% → 42%, NEI acc 0.350 → 0.550) but over-applies:
+    REFUTES acc 0.500 → 0.227.
+  - v3 disputed_explicit: F=0.1108 **Acc=0.2562** HM=0.1547. DISPUTED
+    over-predicted (24 → 73 / 121); REFUTES collapses to 0/22.
+  - v4 v3 + 4 few-shot: F=0.1035 Acc=0.2893 HM=0.1524. Few-shot tempers
+    DISPUTED slightly but kills NEI (0.350 → 0.050). Single NEI
+    demo overfit.
+  - Confirms §0.5.3 hard constraints 1+3 (NEI/DISPUTED are capability
+    gaps, not prompt gaps — must SFT).
+- **Retrieval ceiling discovered (key finding)**. All four prompt
+  variants in Track 2 report **evidence recall ≈ 0.11** (macro 0.10-
+  0.11, micro 0.09-0.10), invariant in prompt. The F-score ceiling
+  under the current `RetrievalConfig(final_k=5, w_bm25=0.3,
+  w_dense=0.7)` is **F ≈ 0.12, HM ≈ 0.21** even with perfect labels.
+  This means Phase 4 SFT can lift label acc but won't move HM unless
+  retrieval improves first.
+- **Phase 3.5 inserted into optimization_plan.md** to audit retrieval
+  before spending GPU-hours on SFT. Plan: sweep `final_k` (5→100),
+  retriever ablation (BM25-only / dense-only / fused / +rerank),
+  fusion weight (w_bm25 ∈ {0.1..0.9}), and synonym multi-query
+  (via `src/query_rewrite.synonym_expand`). Implemented as
+  `scripts/retrieval_ceiling.py` (pure retrieval, no LLM, ~3 min on
+  4080 SUPER).
+- **debug_log.md 复用经验 21+22** added:
+  - 21: prompt can't teach concepts the base model lacks — quantified
+    via v2 NEI +20pp / v3 DISPUTED +19pp counter-examples where the
+    "explicit trigger" instruction over-applies.
+  - 22: F-score ceiling = retrieval recall — every prompt/model sweep
+    should include `evidence_recall` in the report; if it's invariant
+    across variants, switch to retrieval optimization.
+
 ## 2026-05-11 — Session 8 (Phase 1 baseline executed; Track 1 numbers trigger NEI-default diagnosis)
 
 First end-to-end Phase 1 run on AutoDL after all cache prerequisites

@@ -1105,5 +1105,36 @@ python -m scripts.diagnose_phase1 --dataset diag_test
 `src/inference.py:predict_all` 只存 parsed 结果。一旦怀疑 parser fallback，必须再跑一次 inference 才能拿到 raw text 验证。建议加 `--save-raw` flag：写 sidecar `outputs/eval_phase1/track*_*_<dataset>.raw.jsonl`（每行 `{cid, raw_text}`），代价是 inference 慢 < 1%，但诊断时省一次完整重跑。
 
 **实施时机**：等 (a) vs (b) 真相落地后再考虑——如果是 (a) 那确实需要这个 flag；如果是 (b) 则 raw output 用处不大。
+**2026-05-12 更新**：诊断已确认是 (b) — Track 1 confusion matrix 显示模型在主动判别（SUPPORTS 65.8% / REFUTES 59.1%），并非 fallback。raw output flag 优先级降为 P3。
+
+### 21. prompt 教不会 base 模型没有的概念（量化证据）
+
+Phase 2 prompt sweep + diagnose 同时覆盖三个变体，提供**量化反例**：
+
+| 指令 / Instruction | per-label acc 变化 | 副作用 |
+|---|---|---|
+| v2 "Use NEI when ev off-topic" | NEI 0.350 → **0.550** (+20pp) | REFUTES 0.500 → 0.227 (−27pp)：模型把不该 NEI 的 REFUTES 也判 NEI |
+| v3 "Use DISPUTED when ev split" | DISPUTED 0.286 → **0.476** (+19pp) | REFUTES 0.500 → **0.000** (−50pp)；NEI 0.350 → 0.175；总 Acc 暴跌至 0.256 |
+| v4 v3 + 4 few-shot | DISPUTED 0.286 → 0.333 (+5pp) | NEI **0.050**（甚至比 Track 1 还低！）；few-shot 的 NEI 单例反而压死了 NEI 预测 |
+
+**结论**：base 模型对 NEI/DISPUTED 是**能力性缺失**（Track 1 acc 分别 0.025 / 0.000）。prompt 能让模型**输出**这些 label，但不能让它**挑对**该用的 claim。修复必须靠 SFT（数据示范"什么样的证据 → NEI"）+ DPO（对抗"证据矛盾 vs 单边支持"的 chosen/rejected 对）。
+
+**复用**：以后看到一个 label 的 acc 很低时，先做 Track 1 ablation 确认 base 是否本来就不会；如果不会，prompt 工程是浪费。
+
+### 22. F-score 天花板 = retrieval recall，SFT 前必须先审计检索
+
+Phase 2 sweep 顺手发现的**最大教训**：4 个 prompt 在 Track 2 上的 **evidence recall 全部 ≈ 0.11**（macro 0.10-0.11, micro 0.09-0.10），与 prompt 无关——**检索 pipeline 的 top-5 输出本身就只命中 11% 的 gold ev**。
+
+数学：当前架构下，即使 label classification 100% 正确：
+- F = 2·P·R / (P+R)，R = 0.11，假设 P ≈ 0.13 → F ≈ 0.12
+- HM = 2·Acc·F / (Acc+F)，Acc=1.0, F=0.12 → **HM ≈ 0.21（硬上限）**
+
+也就是说：**如果不先解决检索，无论 SFT 多猛，HM 最多到 0.21**。Phase 4 SFT 实际能拉的红利不超过 +0.02。
+
+**触发的新 phase（§3.5）**：在 SFT 前跑 `scripts.retrieval_ceiling.py` 扫四组：`final_k` sweep / 检索器 ablation / fusion 权重 / synonym multi-query。最便宜的 win 估计是 `final_k=5 → 20`（recall 可能翻 2-3 倍，prompt 长度涨 ~1500 token，4080 SUPER 还远没到 OOM）。
+
+**复用**：每次 sweep prompt / model 时**同时打印 evidence recall**——`diagnose_phase1.py` 已实现。如果 recall 在 4-5 个变体上都一样，瓶颈不在 sweep 的维度上，停止 sweep 转向被忽略的 retrieval 维度。
+
+
 
 
