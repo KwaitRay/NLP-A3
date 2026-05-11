@@ -1158,5 +1158,76 @@ Phase 3.5 把 `final_k` 从 5 扫到 20（k ∈ {5, 10, 20}）端到端实测：
 `RetrievalConfig.final_k` default 5 → 20；`phase1_eval --final-k` default 同步；
 非 default k 自动加 `_kN` 后缀防覆盖（`diagnose_phase1._strip_k_suffix` 解析）。
 
+### 24. notebook `snapshot_download(cache_dir=…)` 不会复用 `models/` —— 必须 cache-first
+
+`scripts/download_models.py` 把 Qwen3.5-4B 放在 `models/Qwen3.5-4B/`（仓库相对路径，便于 `ls / scp / git status`）。但 `notebook_autodl.ipynb` 的 `sec2-5-download` cell 默认调用：
+
+```python
+MODEL_CACHE = str(Path(CACHE_ROOT) / "model_cache")   # /root/autodl-tmp/nlp_a3_cache/model_cache
+MODEL_DIR = snapshot_download("Qwen/Qwen3.5-4B", cache_dir=MODEL_CACHE)
+```
+
+`snapshot_download` **只看自己的 `cache_dir`**，不知道 `models/Qwen3.5-4B/` 存在 → 在 AutoDL 上触发 8 GB 重复下载（已发生：2026-05-12 SFT 启动时被截断挽救）。
+
+**修复模式（已落在 `phase1_eval.py:load_model_and_tokenizer` + `notebook_autodl.ipynb` sec2-5-download / sec3-5a）**：
+
+```python
+from src.paths import MODELS_DIR
+_local = MODELS_DIR / "Qwen3.5-4B"
+if (_local / "config.json").exists():
+    MODEL_DIR = str(_local)           # cache hit
+else:
+    MODEL_DIR = snapshot_download(...)  # fallback download
+```
+
+**复用要点**：任何 ModelScope/HF `snapshot_download` 调用前都先看 `models/` —— 这是项目约定（design.md D-013）。Notebook 的每个模型加载 cell 都要走这个模式（包括将来 DPO 加载基座、ablation 加 9B 模型时）。
+
+### 25. AutoDL `git pull` / `pip install` 超时 → `source /etc/network_turbo`
+
+**症状**：
+```
+fatal: unable to access 'https://github.com/...': Failed to connect to github.com port 443 after 130930 ms: Connection timed out
+```
+
+或 `pip install` 长时间卡住、ModelScope 也偶尔超时。
+
+**根因**：AutoDL 实例在国内，默认不能直连 github.com / HuggingFace。
+
+**修复**：AutoDL 官方提供"学术加速通道"（白名单代理，免费，不计流量）：
+
+```bash
+source /etc/network_turbo
+git pull origin main   # 几秒回
+```
+
+**作用域**：当前 shell session。**关 shell 失效**，每次新 ssh / 新 jupyter terminal 都要重 `source`。
+
+**Fallback**（如果 `/etc/network_turbo` 不存在，旧镜像）：
+- ghproxy: `git remote set-url origin https://ghproxy.com/https://github.com/<user>/<repo>.git`
+- 或 `kkgithub.com` / `hub.fastgit.xyz` 等镜像
+- pip：`pip install -i https://pypi.tuna.tsinghua.edu.cn/simple ...`
+
+**已落在 `TODO.md` 附录 + `requirements.txt` 顶部注释**。
+
+### 26. ModelScope canonical 路径 = `Qwen3.5-4B`（一个点），不是 `Qwen3___5-4B`
+
+老版本 ModelScope 在 hub URL 里把 `.` 转义成 `___`（triple underscore），导致 fork 出的代码到处写：
+
+```
+outputs/model_cache/Qwen/Qwen3___5-4B   # 旧的，已 stale
+```
+
+**现在 ModelScope ≥ 1.x** 直接用 `.` 落盘：
+
+```
+.../Qwen/Qwen3.5-4B    # 实际下载目录
+```
+
+`scripts/download_models.py:_download_via_modelscope` 也把内容 move 到 `models/Qwen3.5-4B/` 统一命名。
+
+**所有代码 / 文档 / notebook 都用 `Qwen3.5-4B`** —— 2026-05-12 清掉了仓库里最后 5 处 `Qwen3___5-4B` 残留（optimization_plan / TODO / test_qwen35_inference docstring）。
+
+**新代码约定**：模型目录名 = repo basename（`Qwen/Qwen3.5-4B` → `Qwen3.5-4B`），由 `paths.resolve_model_path()` 统一解析，**不要硬编码 `outputs/model_cache/<owner>/<basename>` 路径**（那是 ModelScope 内部细节，不稳定）。
+
 
 

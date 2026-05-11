@@ -125,8 +125,9 @@ Track 2 (RAG), so all later improvements have a comparison anchor.
 ```bash
 # AutoDL（4080 SUPER, ~10 分钟 / minutes）
 python -m scripts.phase1_eval \
-    --tracks 1,2 --prompts v1 --dataset diag_test \
-    --model-dir outputs/model_cache/Qwen/Qwen3___5-4B
+    --tracks 1,2 --prompts v1 --dataset diag_test
+    # phase1_eval auto-detects models/Qwen3.5-4B/ (cache-first), no need
+    # to pass --model-dir. Override only to point at a different snapshot.
 ```
 
 ### 1.4 产出 / Outputs
@@ -175,8 +176,8 @@ so worst buckets surface at top — those are the Phase 4 targets.
 ```bash
 # 仅 Track 2，全部变体 / Track 2 only, all variants（~15 min on 4080）
 python -m scripts.phase1_eval \
-    --tracks 2 --prompts v2,v3,v4 --dataset diag_test \
-    --model-dir outputs/model_cache/Qwen/Qwen3___5-4B
+    --tracks 2 --prompts v2,v3,v4 --dataset diag_test
+# Base model 由 cache-first 自动定位（models/Qwen3.5-4B/），无需 --model-dir。
 ```
 
 ### 2.4 决策 / Decision
@@ -402,9 +403,9 @@ python -m scripts.run_dpo  # 待实现 / TBD
 
 ```bash
 # 加 --sft-checkpoint / --dpo-checkpoint 参数到 phase1_eval（待实现）
+# Base model 由 cache-first 自动定位（models/Qwen3.5-4B/），无需 --model-dir。
 python -m scripts.phase1_eval \
     --tracks 2,3,4 --prompts <locked> --dataset diag_test \
-    --model-dir outputs/model_cache/Qwen/Qwen3___5-4B \
     --sft-adapter outputs/sft-out/checkpoint-final \
     --dpo-adapter outputs/dpo-out/checkpoint-final
 ```
@@ -563,14 +564,29 @@ AutoDL boxes; submission zip carries only small artifacts.
 - [x] **Phase 4 `weak_buckets` 实现**：`src/sft_dataset.py:build_dataset` 加参数；
       `src/build_stage0.py` 内置 `{nei_underspec:4, disputed_conflict:2, refutes_clear:2}` 配比；
       `tests/test_sft_dataset.py` 覆盖。
+- [x] **v2 SFT 数据本地构建 + 分布验证**（2026-05-12）：`python -m src.build_stage0 --force`
+      产生 sft_train_v2.jsonl 4166 records（×2.11 over v1）。weak_buckets 完全按预期触发：
+      nei_underspec 303→1212 (×4.00), disputed_conflict 90→180 (×2.00),
+      refutes_clear 98→196 (×2.00). 全局 NEI 占比 65.4% → 79.1%
+      （含 hard-neg），hard difficulty 占比 14.3% → 24.1%。
+- [x] **AutoDL SFT 训练 cell 修复**（notebook_autodl.ipynb 9 cells patched）：
+      cache-first model 加载（sec2-5-download/sec3-5a），ms-swift v3.6+ CLI
+      命名（`--tuner_type` / `--quant_bits` / thinking trio），DATA_PATH→v2，
+      MAX_LEN 1024→1536 容纳 k=20 prompt。
+      *Fixes ModelScope re-download + Issue 9 CLI rename + Phase 4 v2 path*.
+- [x] **清理仓库内残留 `Qwen3___5-4B` 路径**（5 处）→ 统一用 `Qwen3.5-4B`。
+      详见 `debug_log.md` 复用经验 26。
 
 ### 进行中 / In progress
-- [ ] **重建 SFT 数据 / Rebuild SFT data**：AutoDL 上跑 `python -m src.build_stage0 --force`
-      生成 `sft_{train,dev_holdout,diag_test}_v2.jsonl`（~5 s）。
-      *Run on AutoDL to regenerate the v2 SFT corpus.*
+- [ ] **AutoDL 上启动 SFT v2 训练**：`source /etc/network_turbo && git pull` →
+      重启 kernel → 顺序跑 setup + sec2-5-download (cache hit) + sec2-5-train
+      → 取消 `!{cmd}` 注释启动训练（~30-45 min on 4080 SUPER）。
+      *Trigger SFT v2 training on AutoDL; expect ~780 steps × ~1 it/s.*
 
 ### 待做 / Todo
-- [ ] Phase 5：SFT v2 训练（ms-swift CLI 指 v2 数据）+ DPO 训练 + 4-track 评估
+- [ ] 训完跑 Track 3（base + SFT + RAG）端到端评估，对比 Track 2 v1 (HM 0.203)
+- [ ] DPO 训练（dev_holdout 错样本 + `synthesise_disputed_contrast`）
+- [ ] Phase 5 4-track 完整对比 + 锁定 production 模型
 - [ ] Phase 6：official dev 终评 + test 集预测 + 报告
 
 ---
@@ -589,7 +605,9 @@ AutoDL boxes; submission zip carries only small artifacts.
 | 2026-05-12 | Phase 3.5 audit (final_k mode) | macro recall@k: 5→0.119 / 10→0.210 / 20→0.333 / 50→0.485 / 100→0.579. Gold ev 集中在 rank 6-20。 | `outputs/eval_phase1/retrieval_ceiling_diag_test.md` |
 | 2026-05-12 | Phase 3.5 done — final_k=20 锁定 | k=5/10/20 端到端实测：HM 0.183 / 0.196 / 0.203（单调）。k=20 NEI acc 0.025（崩塌），SUPPORTS 0.737 / REFUTES 0.682（暴涨）。`RetrievalConfig.final_k` 默认改为 20；`phase1_eval --final-k` 默认 20，非默认值加 `_kN` 后缀防覆盖。 | `outputs/eval_phase1/diagnose_diag_test_k20.md` |
 | 2026-05-12 | Phase 4 implementation | `build_dataset` 加 `weak_buckets` 参数；`build_stage0` 内置 `{nei_underspec:4, disputed_conflict:2, refutes_clear:2}`；tests 全绿。SFT 数据待重建。 | `src/sft_dataset.py`, `src/build_stage0.py`, `tests/test_sft_dataset.py` |
-| TBD | SFT data v2 built | `sft_train_v2.jsonl` 记录数 = ? (~3500 预估)；NEI 类样本占比从 ~25% → ~? | `outputs/sft_data/sft_train_v2.jsonl` |
+| 2026-05-12 | SFT data v2 built (本地) | `sft_train_v2.jsonl` 4166 records（×2.11 over v1）。weak_buckets 100% 按预期触发：nei_underspec 303→1212, disputed_conflict 90→180, refutes_clear 98→196。NEI label 占比 65.4%→79.1%，hard difficulty 占比 14.3%→24.1%。n_shown ≈ k=20。 | `outputs/sft_data/sft_train_v2.jsonl` |
+| 2026-05-12 | AutoDL SFT 启动准备 | notebook_autodl.ipynb 9 cell 修补：cache-first 模型加载（解决 8 GB 重复下载）+ ms-swift v3.6+ CLI 命名（`--tuner_type` / `--quant_bits` / thinking trio + liger + group_by_length + save_total_limit）+ DATA_PATH→v2 + MAX_LEN 1024→1536（容纳 k=20 prompt）。清掉 `Qwen3___5-4B` 残留 5 处。AutoDL pull 用 `source /etc/network_turbo` 走官方加速通道。 | `notebooks/notebook_autodl.ipynb`, `debug_log.md 复用经验 24-26` |
+| TBD | SFT v2 training done | Δ HM vs Track 2 v1 (0.203); NEI acc 0.025 → ?；non-NEI acc 0.580 → ? | `outputs/sft-out/checkpoint-final` + diagnose_phase1 post-SFT 报告 |
 | TBD | Phase 2 done | 锁定 prompt: v?  Track 2 HM 提升 +? | `outputs/eval_phase1/summary_diag_test.md` |
 | TBD | Phase 4 done | weak_buckets 配比: {...} → sft_train_v2.jsonl | `outputs/sft_data/sft_train_v2_meta.json` |
 | TBD | Phase 5 done | SFT/DPO HM = ?, 最弱桶提升: ... | Phase 5 eval reports |

@@ -21,8 +21,8 @@ Run::
 
     cd /root/Assignment3   # or wherever the repo lives
     python -m scripts.test_qwen35_inference \\
-        --model-dir outputs/model_cache/Qwen/Qwen3___5-4B   # if pre-downloaded
-        # OR omit --model-dir to auto-download from ModelScope
+        --model-dir models/Qwen3.5-4B   # if pre-downloaded via scripts.download_models
+        # OR omit --model-dir to auto-download from ModelScope into outputs/model_cache/
 
 Exit code: 0 if all four sections complete; non-zero on any hard error.
 """

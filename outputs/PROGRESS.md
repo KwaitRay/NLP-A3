@@ -2,6 +2,58 @@
 
 > Live status tracker. Update when crossing milestones. Plan in `~/.claude/plans/fancy-mapping-lemur.md`.
 
+## 2026-05-12 — Session 11 (v2 SFT data built + notebook patched for AutoDL SFT kickoff)
+
+The path from "Phase 4 implementation pushed" to "SFT is actually about to
+train on AutoDL" had several surprise blockers — each documented in
+debug_log.md as 复用经验 24-26.
+
+- **v2 SFT data built locally + verified** (`python -m src.build_stage0 --force`):
+  4166 records (×2.11 over v1's 1972). weak_buckets fired exactly as
+  designed: nei_underspec 303→**1212 (×4.00)**, disputed_conflict 90→**180
+  (×2.00)**, refutes_clear 98→**196 (×2.00)**. Untargeted buckets unchanged.
+  Label distribution shifted: NEI 65.4% → **79.1%** (heavy NEI signal for
+  base model's NEI capability gap); hard difficulty 14.3% → **24.1%**.
+  n_shown stable at 19-20 (rejection-sampling edge case noted, harmless).
+- **AutoDL SFT kickoff blocked by ModelScope re-download** (debug_log 复用经验 24):
+  notebook's `sec2-5-download` unconditionally called `snapshot_download
+  (cache_dir=CACHE_ROOT/model_cache/)`, which doesn't see the existing
+  `models/Qwen3.5-4B/` placed by `scripts.download_models`. User caught
+  it mid-download (13% / 21% on two safetensors shards) and asked why.
+- **AutoDL `git pull` blocked by GFW** (debug_log 复用经验 25):
+  `Failed to connect to github.com port 443 after 130930 ms`. Fix:
+  `source /etc/network_turbo` (AutoDL official whitelist proxy for
+  github / huggingface / pytorch / conda; per-shell scope).
+- **Notebook patched — 9 cells, one commit**:
+  - sec2-5-download: cache-first (prefer models/Qwen3.5-4B/ → fallback
+    snapshot_download). Same pattern as `phase1_eval.py:load_model_and_tokenizer`.
+  - sec3-5a: identical cache-first + auto bf16/fp16 by hardware.
+  - sec2-5-train: full ms-swift v3.6+ flag refresh (`--train_type` →
+    `--tuner_type`, `--quant_bits` not `--quantization_bit`, +thinking
+    trio +liger +group_by_length +save_total_limit), DATA_PATH→v2.
+  - sec2-6-code (DPO): same flag rename, +thinking flags.
+  - sec1-4-code: k=20 + weak_buckets, writes v2.
+  - sec2-3-code: drops explicit `final_k=5` (uses new default 20).
+  - sec2-5-md / autodl-reconnect: doc references updated to v2.
+  - autodl-setup-gpu: MAX_LEN 1024→1536 (k=20 evidence prompts can hit
+    1024); QUANT_FLAG uses --quant_bits.
+- **Stale `Qwen3___5-4B` triple-underscore paths cleaned** (debug_log
+  复用经验 26): old ModelScope used `___` to escape `.` in folder names;
+  current ModelScope writes `Qwen3.5-4B` directly (confirmed in user's
+  download stdout). Replaced 5 lingering references (optimization_plan,
+  TODO, test_qwen35_inference docstring) with `models/Qwen3.5-4B/` or
+  removed `--model-dir` entirely now that cache-first auto-locates.
+- **AutoDL pull conflict pattern observed** (informational): pushing a
+  new notebook version into a directory where JupyterLab autosaved
+  execution counts / cell outputs causes `git pull` to refuse with
+  "untracked working tree files would be overwritten" or "local changes
+  would be overwritten". Resolution recipe (also in TODO.md):
+  `git checkout -- notebooks/*.ipynb` (lose autosave noise) or
+  `git stash` + inspect-then-drop (preserve manual edits cautiously).
+- **Repo state going into Session 12**: code + docs + notebook ready;
+  v2 SFT data needs to be rebuilt on AutoDL (gitignored, doesn't pull);
+  SFT training kickoff blocked only on running 5 cells.
+
 ## 2026-05-12 — Session 10 (Phase 3.5 final_k locked + Phase 4 weak_buckets implemented)
 
 End-to-end retrieval audit + Phase 4 implementation. Repo state moves
