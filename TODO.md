@@ -47,6 +47,11 @@ python -m src.build_stage0
 # 一键下所有模型到 models/（如果之前 outputs/model_cache 下过 Qwen，--skip qwen）
 python -m scripts.download_models
 
+# ModelScope 镜像对 bge-* 系列只发 pytorch_model.bin；transformers 在 torch
+# 2.5 下走 torch.load 触发 CVE-2025-32434 检查会 ValueError。本地一次性把
+# 所有只有 .bin 的目录转成 .safetensors（~30s/file，纯 CPU，免网络）。
+python -m scripts.convert_bin_to_safetensors
+
 # 建索引（BM25 + dense 全套，~20 min）
 python -m scripts.build_indexes
 ```

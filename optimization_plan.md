@@ -32,6 +32,76 @@
 
 ---
 
+## 0.5. Base 模型能力探针（先决条件）/ Base-model Capability Probe (Precondition)
+
+> 进入 Phase 1 前已用 `scripts/test_qwen35_inference.py` 在 AutoDL
+> 4080 SUPER（4-bit NF4）对 base **Qwen3.5-4B** 做了 4 项探针测试，
+> 结果作为 **§4.3 SFT 数据扩充策略的硬约束** 来源。原始记录见
+> `debug_log.md` 会话 2 "实测数据" 段。
+>
+> Before Phase 1 we ran `scripts/test_qwen35_inference.py` on AutoDL
+> (RTX 4080 SUPER, 4-bit NF4) to probe four capability dimensions of
+> the base **Qwen3.5-4B**. Findings are the source of the **hard
+> constraints** that drive §4.3 SFT data-augmentation strategy. Raw
+> log: `debug_log.md` Session 2 "实测数据".
+
+### 0.5.1 测试条件 / Test setup
+
+| 维度 / Dimension | 值 / Value |
+|---|---|
+| 硬件 / Hardware | RTX 4080 SUPER 31.5 GB VRAM |
+| 模型 / Model | Qwen3.5-4B base, NF4 4-bit + double-quant |
+| dtype | bf16（Ampere+ 自检 / auto-detected） |
+| VRAM 占用 / VRAM footprint | **2.9 GB**（4-bit 加载后 / post 4-bit load） |
+| 首次加载 / First load | 7.9 s（首次从 ModelScope 下载 ~9 min / 8 GB） |
+| 样本 / Sample claims | 3 manual (SUPPORTS / REFUTES / NEI) + 1 DISPUTED w/ mixed ev |
+
+### 0.5.2 关键发现 / Key findings
+
+| 区段 / Section | 设置 / Setup | 发现 / Finding |
+|---|---|---|
+| **4a no-RAG, greedy** | base prompt + 3 manual claims | SUPPORTS ✓ / REFUTES ✓ / **NEI → REFUTES ✗**（base 模型无 "我不知道" 概念） |
+| **4b RAG fake-ev, greedy** | system prompt + 3 numbered evidences | 严格输出 `LABEL ##[1,2]##` 格式 — prompt 语法 base 模型已会跟 |
+| **4c SC, easy SUPPORTS** | 5 samples @ T=0.7, top_p=0.9 | **5/5 一致** → SC 在易题上零增益 |
+| **4c SC, DISPUTED + mixed ev** | 同上 + 1 supporting / 1 refuting / 1 off-topic | **待 Phase 1 后重跑确认** — 期望看到 ≥2 个不同 label |
+
+### 0.5.3 推导出的 SFT 数据三条硬约束 / Three hard constraints on SFT data
+
+源自 §0.5.2，覆盖 §4.3 augmentation strategy / Derived from §0.5.2,
+binding on §4.3:
+
+1. **NEI 类必须 oversample**：base 模型对 NEI claim 强行裁决（4a 实测），
+   SFT 训练分布中 NEI 类需 oversample 到 ≥ 25%。已在
+   `build_dataset(n_hard_neg=1)` 通过 hard-negative 样本实现（一条真
+   样本 + 一条同 claim 配无关 evidence 重标 NEI），train 1972 = 986×2
+   恰好满足。Phase 4 弱桶扩充时若 NEI 桶仍最差，再加 `n_hard_neg=2`。
+   *NEI must be oversampled* — currently achieved via `n_hard_neg=1`
+   (986 real + 986 hard-neg = 1972), bump to `n_hard_neg=2` only if
+   the NEI bucket remains the weakest after Phase 4.
+2. **Citation 格式样本可保持稀疏**：base 模型已能严格输出
+   `LABEL ##[i,j]##`（4b 实测），SFT 不需要为格式做样本增强，每条记
+   录一次 demo 即够。
+   *Citation-format examples stay lean* — base model already follows
+   `LABEL ##[i,j]##` strictly (4b finding); no need for format-only
+   augmentation, one demo per record suffices.
+3. **DISPUTED / 高分歧桶优先扩充**：4c 在易题上 5/5 一致 → SC 仅在
+   模糊样本上有价值（DISPUTED, scenario ∈ {refutes_partial,
+   nei_topic_off}）。Phase 4 §4.3 数据扩充倍率 r：高分歧桶取上限
+   r=2.0，易桶取 r=1.0。同时 Phase 5 DPO 务必包含
+   `synthesise_disputed_contrast` 生成的 DISPUTED-vs-SUPPORTS 对抗对。
+   *Prioritize DISPUTED-style augmentation* — SC is value-add only on
+   ambiguous claims; apply r=2.0 multiplier on those buckets, keep
+   r=1.0 on supports_clear-type buckets. Phase 5 DPO must include the
+   DISPUTED-vs-SUPPORTS contrast pairs.
+
+### 0.5.4 未探针的、留给 Phase 1 解决的 / Open questions for Phase 1
+
+- 模型在 **Track 2 真 RAG** 上的端到端 HM —— Phase 1.4 输出 `track2_v1_diag_test.md` 给答案
+- **DISPUTED claim 上 SC 是否拉开分歧** —— 改进版 4c 排在 Phase 1 之后立刻补一次（在 AutoDL 上跑改 prompt 或重试 base）
+- **4-bit 量化对 logit 噪声**是否压低了 SC 多样性 —— 仅当 Phase 4 SC 仍无效时再排查（A/B：4-bit vs fp16）
+
+---
+
 ## 1. Phase 1 — Baseline 评估 / Baseline Evaluation
 
 ### 1.1 目的 / Purpose
@@ -167,6 +237,13 @@ training budget, biggest lift on weakest buckets.
 - n ≥ 5（样本数够，结论稳）
 
 ### 4.3 数据扩充策略 / Augmentation strategy
+
+> **前置约束 / Hard prerequisites** — 必须先满足 §0.5.3 的三条硬约束
+> （NEI oversample + citation 格式样本稀疏 + DISPUTED 优先扩充）。下表
+> 是在硬约束之上的桶级精调。
+>
+> The three hard constraints from §0.5.3 must hold first; the table
+> below adds bucket-level fine-tuning on top of them.
 
 按弱桶类型分别处理 / Different tactics per bucket type:
 
