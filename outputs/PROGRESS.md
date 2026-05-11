@@ -2,6 +2,44 @@
 
 > Live status tracker. Update when crossing milestones. Plan in `~/.claude/plans/fancy-mapping-lemur.md`.
 
+## 2026-05-11 — Session 8 (Phase 1 baseline executed; Track 1 numbers trigger NEI-default diagnosis)
+
+First end-to-end Phase 1 run on AutoDL after all cache prerequisites
+(BM25, dense, models, messages-format SFT data) landed. Headline numbers
+came back fast but Track 1 Acc looked suspicious; spawned a diagnostic
+tool rather than guessing.
+
+- **Phase 1 eval ran clean** (`python -m scripts.phase1_eval --tracks
+  1,2 --prompts v1 --dataset diag_test`, ~4.5 min total on 4080 SUPER):
+  - Track 1 (no-RAG, greedy):  F=0.0000  Acc=**0.3223**  HM=0.0000  (69.7s / 121 claims)
+  - Track 2 (RAG, greedy):     F=0.1169  Acc=0.4215   HM=0.1830  (199.3s / 121 claims)
+  - Outputs at `outputs/eval_phase1/track{1,2}_v1_diag_test.{json,md}` +
+    `summary_diag_test.md`.
+- **Suspicion**: Track 1 Acc=0.3223 = 39/121 is one claim shy of
+  `gold_NEI/n = 40/121 = 0.3306`. Two competing hypotheses:
+  - **(a)** Parser fallback dominates: model output doesn't carry
+    `LABEL ##[..]##`, `parse_response` returns `default_label='NOT_ENOUGH_INFO'`
+    for ~all claims, accidentally hitting the NEI majority.
+  - **(b)** Base model genuinely predicts a mix of labels but is biased
+    toward NEI on the non-NEI claims.
+  - Fix paths diverge sharply: (a) → prompt v2 / parser tweak; (b) →
+    Phase 4 SFT data tilt. Must distinguish before acting.
+- **`scripts/diagnose_phase1.py` added** — pure analysis on saved JSONs
+  (no model loading). Per (track, prompt) it reports predicted-vs-gold
+  label distribution, 4×4 confusion matrix, per-gold-label correctness,
+  evidence recall (Track 2+), a defaulting-to-NEI heuristic flag, and
+  sample mispredictions for eyeballing. CLI mirrors `phase1_eval`:
+  `python -m scripts.diagnose_phase1 --dataset diag_test`. Writes
+  `outputs/eval_phase1/diagnose_<dataset>.md` + stdout summary.
+- **debug_log.md Session 3 + Issue 17** capture the full hypothesis split
+  and the 复用经验 19-20 (don't trust majority-class-looking Acc;
+  consider adding `--save-raw` to `predict_all` later).
+- **TODO.md** gets a new Step 2.5 inserting the diagnostic before
+  Step 3 (Phase 2 prompt sweep).
+- **optimization_plan.md** §9 progress flips Phase 1 from "in progress"
+  to "data collected, diagnosing"; §10 decision log gets the headline
+  numbers as a new row.
+
 ## 2026-05-11 — Session 7 (data-format migration + AutoDL .bin→.safetensors workaround)
 
 Same calendar day as Session 6 but distinct enough to log separately. Covers

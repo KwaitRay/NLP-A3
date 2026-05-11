@@ -446,12 +446,18 @@ AutoDL boxes; submission zip carries only small artifacts.
 - [x] 本地 SFT 数据迁移到 messages 格式（重跑 `src.build_stage0`）
 - [x] §0.5 base 模型能力探针写入 plan（4a-4c 实测 → SFT 数据三条硬约束）
 - [x] `scripts/convert_bin_to_safetensors.py`（应对 ModelScope 缺 safetensors + transformers CVE-2025-32434）
+- [x] AutoDL 上 dense 索引建好（9.2 GB）+ Phase 1 第一次评估跑通（Track 1+2 × v1 on diag_test）
+- [x] `scripts/diagnose_phase1.py`（应对 Phase 1 数字异常 — 见 debug_log 问题 17）
 
 ### 进行中 / In progress
-- [ ] AutoDL 上 `git pull` + `convert_bin_to_safetensors` + `build_indexes`（dense）
-- [ ] Phase 1 baseline 评估（v1 on diag_test）
+- [ ] **Phase 1 结果诊断 / Phase 1 result diagnosis**：Track 1 Acc=0.3223 ≈ NEI 占比 0.3306，
+      需 `diagnose_phase1.py` 区分 (a) parser fallback 全 NEI vs (b) 模型真有判别但偏弱。
+      *Track 1 Acc looks identical to NEI fraction; need diagnostic to distinguish
+      (a) parser fallback vs (b) genuine bias before deciding next move.*
 
 ### 待做 / Todo
+- [ ] 根据诊断结果走 (a) prompt/parser 修复 或 (b) 直接进 Phase 2 / 4
+      *(a) prompt v2 / parser fix or (b) proceed to Phase 2 / 4 — branches on diagnosis*
 - [ ] Phase 2 prompt 变体扫描（v2-v4 on diag_test）
 - [ ] Phase 3-4：弱桶定位 + 给 `build_dataset` 加 `weak_buckets` 参数
 - [ ] Phase 5：SFT v2 训练 + DPO 训练 + 4-track 评估
@@ -466,7 +472,8 @@ AutoDL boxes; submission zip carries only small artifacts.
 | Date | Phase | Decision | Source data |
 |---|---|---|---|
 | 2026-05-11 | (pre-Phase 1) | smoke test 显示 base 模型能输出 `LABEL ##[..]##` 干净格式，5/5 SC 同票 (SUPPORTS) 但 sample 5 同时引 ev-pro 和 ev-con → base 缺"识别证据矛盾"能力 | `materials/qwen3.5_key_points.docx` + AutoDL smoke test logs |
-| TBD | Phase 1 done | Track 1 (HM=?), Track 2 (HM=?), 最弱 3 桶: ?? | `outputs/eval_phase1/track2_v1_diag_test.md` |
+| 2026-05-11 | Phase 1 (raw) | Track 1 v1 F=0.0000 Acc=0.3223 HM=0.0000；Track 2 v1 F=0.1169 Acc=0.4215 HM=0.1830。Track 1 Acc 几乎=NEI 占比 0.3306 → 触发 NEI-default 诊断（debug_log 问题 17 + diagnose_phase1.py） | `outputs/eval_phase1/summary_diag_test.md` |
+| TBD | Phase 1 diagnosed | (a) parser fallback vs (b) 模型真偏弱 — 取决于 `diagnose_phase1.py` 报告 | `outputs/eval_phase1/diagnose_diag_test.md` |
 | TBD | Phase 2 done | 锁定 prompt: v?  Track 2 HM 提升 +? | `outputs/eval_phase1/summary_diag_test.md` |
 | TBD | Phase 4 done | weak_buckets 配比: {...} → sft_train_v2.jsonl | `outputs/sft_data/sft_train_v2_meta.json` |
 | TBD | Phase 5 done | SFT/DPO HM = ?, 最弱桶提升: ... | Phase 5 eval reports |

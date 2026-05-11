@@ -1009,3 +1009,101 @@ AutoDL / Colab 这种容器化环境，建实例比 conda 里把 PyTorch 从 cu1
 | messages 格式 SFT 数据 | 跑 cell-1-sft-code 重新 build_dataset | <30 s |
 | BM25 索引 | 跑 cell 2.1 | ~3 min |
 | dense 索引 | 跑 cell 2.2（首次 ~30 min；用 4080 比 T4 快很多） | ~15 min（4080 估算） |
+
+---
+
+# 会话 3 — 2026-05-11 — Phase 1 baseline 跑通 + 数字异常诊断
+
+## 会话元信息
+
+- **日期**: 2026-05-11
+- **环境**: AutoDL 4080 SUPER 31.5 GB VRAM；BM25 (146 MB) + dense (9.2 GB) 索引 + 4 个模型权重 + messages 格式 SFT 数据全部就绪
+- **范围**: 跑 `scripts.phase1_eval --tracks 1,2 --prompts v1` 的首次完整评估；结果数字触发新一轮诊断
+
+---
+
+## 问题 17 — Track 1 Acc 几乎等于 NEI 占比，疑似 parser fallback 全部走 NEI
+
+**现象**
+
+`python -m scripts.phase1_eval --tracks 1,2 --prompts v1 --dataset diag_test` 跑完：
+
+| Track | F | Acc | HM | 耗时 |
+|---|---|---|---|---|
+| 1 (no-RAG, greedy) | 0.0000 | **0.3223** | 0.0000 | 69.7 s / 121 条 |
+| 2 (RAG, greedy)    | 0.1169 | 0.4215     | 0.1830 | 199.3 s / 121 条 |
+
+`diag_test` 的 label 分布：
+
+| label | n | 占比 |
+|---|---|---|
+| NOT_ENOUGH_INFO | 40 | 33.06% |
+| SUPPORTS | 38 | 31.40% |
+| REFUTES | 22 | 18.18% |
+| DISPUTED | 21 | 17.36% |
+
+**Track 1 Acc=0.3223 = 39/121** 离"全猜 NEI 多数类"的 40/121 只差 1 条，可疑。
+
+**根因假设（两条）**
+
+1. **(a) Parser fallback 全部走 NEI**：模型生成的文本不含 `LABEL ##[..]##` 格式 → `parse_response` 返回 `default_label='NOT_ENOUGH_INFO'`（见 `src/prompt.py:228`）→ Track 1 Acc 恰好等于 NEI 比例。如果是这条，**需要**改 prompt 或 parser，**不需要** Phase 4 数据扩充。
+2. **(b) 模型真在生成 4 类标签，但偏 NEI**：模型能输出 SUPPORTS / REFUTES，但对 non-NEI 类的判别力很弱，恰好猜对 NEI 那部分。如果是这条，prompt 帮不上忙，需要 Phase 4 SFT 数据扩充。
+
+**两者的修复路径完全不同**，必须先区分清楚再行动。
+
+**修复路径不明的次要支撑论据**
+
+跟问题 12 的"0 秒报 154 条 AttributeError"不一样：
+- 当前 69.7 s / 121 条 = 0.58 s/条，**模型是真的在生成**（167 it/s 那次是 0 推理直接 fallback；这次 1.74 it/s 是正常生成速度）
+- `_apply_template_to_device` helper 已就位（问题 12 修复保留）
+- 但 `predict_all` 没保存 raw model output，只存了 parsed 后的 `(claim_label, evidences)`，**所以无法从 saved JSON 直接确认 hypothesis (a)**
+
+**诊断工具**：新建 `scripts/diagnose_phase1.py`
+
+零模型加载、纯分析现有 `outputs/eval_phase1/track*_v1_diag_test.json` 文件。每个 (track, prompt) 输出：
+
+- **predicted vs gold label distribution** — 看预测分布是否塌缩到 NEI
+- **confusion matrix (4×4)** — 看 non-NEI gold 被预测成什么
+- **per-gold-label correctness** — 拆开每个 gold label 的准确率
+- **evidence recall (Track 2+)** — 拼检索质量与模型是否在 cite 正确 ev
+- **defaulting-to-NEI heuristic flag** — 自动判定：predicted NEI > 50% **且** non-NEI gold 中 ≥50% 被预测成 NEI → ⚠️ pattern
+- **sample mispredictions** — 3 条 non-NEI gold → NEI、3 条 non-NEI gold → 另一个 non-NEI、3 条 correct non-NEI（供眼检）
+
+**运行**：
+
+```bash
+# AutoDL 上跑 phase1_eval 之后
+python -m scripts.diagnose_phase1 --dataset diag_test
+```
+
+**输出**：`outputs/eval_phase1/diagnose_<dataset>.md` + stdout 跨 run 摘要。
+
+**期望读法**
+
+- 如果 `非-NEI acc` 普遍接近 0 + `预测 NEI 占比` > 50% → **(a) parser fallback 模式确认** → 下一步：用 `scripts.test_qwen35_inference` 重跑几条 diag_test 实例，打印 raw output 看具体输出长什么样；改 prompt v2 或在 `parse_response` 加更宽容的容错。
+- 如果 `非-NEI acc` 显著大于 0 且 confusion matrix 在对角线附近有信号 → **(b) base 模型真在判别只是偏弱** → Phase 2 跑 v2/v3/v4 看 prompt 能否拉起，然后进 Phase 4。
+
+**Track 2 F=0.1169 的次问题**：先放一放。Track 2 Acc=0.4215 比 Track 1 +9 条说明 RAG 真有用；F 偏低可能是 (1) 检索没命中 gold ev，或 (2) 模型 cite 的 index 错。诊断脚本里的 evidence recall 行能回答 (1)；(2) 需 raw output 才能查。如果 (1) 不严重，**Phase 2 prompt sweep 后再回头看 (2)**。
+
+**涉及文件**
+
+- `scripts/diagnose_phase1.py`（**新建**）
+- `TODO.md` — Step 2.5（新增）插入诊断步骤；Step 3 后移
+- `optimization_plan.md` §9 进度更新 + §10 决策日志追加一行
+- `outputs/PROGRESS.md` — 会话 8 记录
+
+---
+
+## 复用经验（会话 3 增量）
+
+### 19. 数字像多数类基线时第一反应：parser fallback，不是模型偏置
+
+只看 Acc 一个数会被"恰好等于多数类占比"误导。Phase 1 之后**强制走 confusion matrix + 预测分布**，而不是只盯 Acc / HM。`diagnose_phase1.py` 把这步固化成 1 行命令。
+
+### 20. predict_all 应该保留 raw output 选项（待办）
+
+`src/inference.py:predict_all` 只存 parsed 结果。一旦怀疑 parser fallback，必须再跑一次 inference 才能拿到 raw text 验证。建议加 `--save-raw` flag：写 sidecar `outputs/eval_phase1/track*_*_<dataset>.raw.jsonl`（每行 `{cid, raw_text}`），代价是 inference 慢 < 1%，但诊断时省一次完整重跑。
+
+**实施时机**：等 (a) vs (b) 真相落地后再考虑——如果是 (a) 那确实需要这个 flag；如果是 (b) 则 raw output 用处不大。
+
+

@@ -3,7 +3,7 @@
 > 单页"明天打开就知道做什么"的快速恢复文档。
 > 完整计划见 `optimization_plan.md`，本文只列**接下来一步要做什么**。
 >
-> 最后更新: 2026-05-11 晚（本地 BM25 已建好，下一步在 AutoDL）
+> 最后更新: 2026-05-11 深夜（Phase 1 跑通，数字异常待诊断）
 
 ---
 
@@ -16,61 +16,63 @@
   - `scripts/build_indexes.py` 独立索引构建
   - `scripts/phase1_eval.py` Track 1/2 × prompt 扫描 harness
   - `scripts/download_models.py` 一键下所有第三方权重到 `models/`
+  - `scripts/diagnose_phase1.py` 预测分布 / confusion matrix / NEI-default 检测
 - [x] SFT/DPO 数据迁移到 ms-swift messages 标准格式 + 测试 all green
 - [x] 持久化策略落地：cell-1-sft-code 改 cache-first，paths 加 `MODELS_DIR + resolve_model_path()`
-- [x] 文档：`design.md` v1.1 (D-011~D-015), `debug_log.md` 会话 2, `optimization_plan.md` (bilingual 6-phase plan)
+- [x] 文档：`design.md` v1.1 (D-011~D-015), `debug_log.md` 会话 2+3 (问题 1-17), `optimization_plan.md` (bilingual 6-phase plan)
 - [x] **本地 4 个模型权重全部下载完成**（`models/` 下 ~11 GB）
-- [x] Push 到 `origin/main`（最新 commit `003122a`）
 - [x] **本地 BM25 索引建好**（`outputs/bm25_index/bm25/` 5 个文件，~200 MB）→ 本地 retrieval 现在可 dry-run
+- [x] **AutoDL dense 索引建好**（`outputs/dense_index/`, 9.2 GB）+ safetensors 转换 + messages 格式 SFT 数据全部就位
+- [x] **Phase 1 baseline 第一次评估跑通**（Track 1+2 × v1 on diag_test，~4.5 min on 4080 SUPER）
+  - Track 1 (no-RAG, greedy):  F=0.0000  Acc=0.3223  HM=0.0000
+  - Track 2 (RAG, greedy):     F=0.1169  Acc=0.4215  HM=0.1830
+  - ⚠️ Track 1 Acc=0.3223 ≈ NEI 占比 0.3306 → 触发诊断（见下方 Step 2.5）
 
 ---
 
 ## 🎯 明天的下一步（按顺序）
 
-### Step 1 — AutoDL：拉新代码 + 重生成 SFT 数据 + 同步模型 + 建 dense 索引
+### ✅ Step 1 — AutoDL 环境 / cache 全部就位（已完成）
 
-> **为什么 dense 不在本地建**：bge-m3 fp16 要 ~5 GB VRAM，你本地 6 GB 太紧；编码 1.2M 段在 CPU 上慢到不可接受。AutoDL 4080 SUPER 上 ~15 min 完事。
->
-> **为什么要重跑 `build_stage0`**：`outputs/sft_data/*.jsonl` 和 `evidence.json` 都在 `.gitignore` 里，`git pull` 拉不到。AutoDL 上必须本地重生成一份 messages-format 的 SFT 数据（~5s，前提：AutoDL 上已有 `data/evidence.json`）。
+参考下方"附录：Step 1 完整命令"（保留作环境重建参考）。
 
-```bash
-# 在 AutoDL 上
-cd ~/autodl-tmp/NLP-A3
-git pull origin main
-
-# 装新依赖（modelscope 已装；huggingface_hub 应该 transformers 自带）
-pip install -U modelscope huggingface_hub  # 保险起见
-
-# 重生成 SFT 数据（messages 格式；前提 data/evidence.json 已就位）
-python -m src.build_stage0
-
-# 一键下所有模型到 models/（如果之前 outputs/model_cache 下过 Qwen，--skip qwen）
-python -m scripts.download_models
-
-# ModelScope 镜像对 bge-* 系列只发 pytorch_model.bin；transformers 在 torch
-# 2.5 下走 torch.load 触发 CVE-2025-32434 检查会 ValueError。本地一次性把
-# 所有只有 .bin 的目录转成 .safetensors（~30s/file，纯 CPU，免网络）。
-python -m scripts.convert_bin_to_safetensors
-
-# 建索引（BM25 + dense 全套，~20 min）
-python -m scripts.build_indexes
-```
-
-### Step 2 — AutoDL：Phase 1 baseline（v1 prompt, ~10 min）
+### ✅ Step 2 — Phase 1 baseline 跑通（已完成，但数字需诊断）
 
 ```bash
-python -m scripts.phase1_eval \
-    --tracks 1,2 --prompts v1 --dataset diag_test
+python -m scripts.phase1_eval --tracks 1,2 --prompts v1 --dataset diag_test
 ```
 
 产出：
-- `outputs/eval_phase1/track1_v1_diag_test.{json,md}`
-- `outputs/eval_phase1/track2_v1_diag_test.{json,md}`
+- `outputs/eval_phase1/track1_v1_diag_test.{json,md}` — Acc=0.3223
+- `outputs/eval_phase1/track2_v1_diag_test.{json,md}` — F=0.1169, Acc=0.4215, HM=0.1830
 - `outputs/eval_phase1/summary_diag_test.md`
 
-**关键看 `track2_v1_diag_test.md`** —— per-bucket 表已按 HM 升序，**最差的桶在最上面**，那就是 Phase 4 SFT 数据扩充的目标。
+### ⚠️ Step 2.5 — 诊断 Track 1 Acc ≈ NEI 占比 的异常（**新增，明天第一步**）
+
+Track 1 Acc=0.3223 = 39/121 离"全猜 NEI 多数类"的 40/121 只差 1 条。
+两种可能（见 `debug_log.md` 问题 17）：
+
+- (a) Parser fallback 全走 NEI → 改 prompt v2 / parser
+- (b) 模型真在判别只是偏弱 → 进 Phase 2 / Phase 4
+
+**先跑诊断脚本**（< 5 s，纯分析 saved JSON，无 GPU）：
+
+```bash
+python -m scripts.diagnose_phase1 --dataset diag_test
+```
+
+产出：`outputs/eval_phase1/diagnose_diag_test.md`。看：
+- **非-NEI acc** 列：接近 0 → (a) 确认；显著大于 0 → (b)
+- **predicted NEI 占比**：> 50% 且自动 flag ⚠️ → (a) 确认
+- **confusion matrix**：对角线有信号则 (b)；列塌缩到 NEI 那一列则 (a)
+
+**走向 (a) 时**：跑 `scripts.test_qwen35_inference` 重生成几条 diag_test 实例，打印 raw output 看具体输出。然后改 prompt v2 或 `parse_response` 容错。
+**走向 (b) 时**：直接进 Step 3 跑 Phase 2 prompt sweep。
 
 ### Step 3 — AutoDL：Phase 2 prompt 扫描（v2/v3/v4, ~15 min）
+
+> **前置条件**：Step 2.5 诊断已确定走 (b) 路径（模型真在判别），或走 (a)
+> 修复完成。否则 v2/v3/v4 在 broken pipeline 上跑没意义。
 
 ```bash
 python -m scripts.phase1_eval \
@@ -78,13 +80,45 @@ python -m scripts.phase1_eval \
 ```
 
 `summary_diag_test.md` 会被覆盖成包含 v1-v4 的对比，看哪个 prompt 在 Track 2 上 HM 最高 → 锁定。
+**Track 2 v1 HM=0.1830 是新基线**，v2/v3/v4 必须显著高才有意义。
+
+也可以顺手把 v2/v3/v4 也跑一遍 Track 1，看 Step 2.5 诊断的 (a) 假设是否能被 prompt v2 直接修掉：
+```bash
+python -m scripts.phase1_eval --tracks 1 --prompts v2,v3,v4 --dataset diag_test
+python -m scripts.diagnose_phase1 --dataset diag_test  # 自动覆盖所有新 run
+```
 
 ### Step 4 — 把决策填到 `optimization_plan.md` §10
 
-在决策日志表追加一行：
+在决策日志表追加：
 ```markdown
-| 2026-05-12 | Phase 1 done | Track 1 HM=?, Track 2 HM=?, 最弱 3 桶: ?? | track2_v1_diag_test.md |
-| 2026-05-12 | Phase 2 done | 锁定 prompt: v?  Track 2 HM 提升 +? | summary_diag_test.md |
+| 2026-05-12 | Phase 1 diagnosed | (a) parser fallback 或 (b) 模型偏弱 — 实际为 ?? | diagnose_diag_test.md |
+| 2026-05-12 | Phase 2 done | 锁定 prompt: v?  Track 2 HM 从 0.1830 → ? | summary_diag_test.md |
+```
+
+---
+
+## 📦 附录：Step 1 完整命令（环境重建时用）
+
+`AutoDL` 实例丢失或换机时整套重跑。前提：`data/evidence.json` 已传到 `~/autodl-tmp/NLP-A3/data/`。
+
+```bash
+cd ~/autodl-tmp/NLP-A3
+git pull origin main
+
+pip install -U modelscope huggingface_hub  # 保险
+
+# 重生成 messages 格式 SFT 数据（~5 s）
+python -m src.build_stage0
+
+# 一键下所有模型到 models/（~11 GB）
+python -m scripts.download_models
+
+# bge-* 系列只有 .bin；transformers + torch 2.5 不让 torch.load → 本地转 safetensors
+python -m scripts.convert_bin_to_safetensors
+
+# 建索引（BM25 ~3 min + dense ~15 min on 4080 SUPER）
+python -m scripts.build_indexes
 ```
 
 ---
@@ -123,4 +157,4 @@ python -m scripts.phase1_eval \
 
 ---
 
-**下次 session 第一句话**：在 AutoDL 上跑 Step 1 → Step 2，把 `summary_diag_test.md` 和 `track2_v1_diag_test.md` per-bucket 表贴回来。
+**下次 session 第一句话**：在 AutoDL 上跑 `python -m scripts.diagnose_phase1 --dataset diag_test`，把 `outputs/eval_phase1/diagnose_diag_test.md` 的 cross-run summary 表 + Track 1 confusion matrix 贴回来。
