@@ -2,6 +2,62 @@
 
 > Live status tracker. Update when crossing milestones. Plan in `~/.claude/plans/fancy-mapping-lemur.md`.
 
+## 2026-05-11 — Session 6 (local prep complete, ready for AutoDL Phase 1)
+
+Local prerequisites for Phase 1 evaluation now fully satisfied. Next session is AutoDL.
+
+- **BM25 index built locally** (`outputs/bm25_index/bm25/`):
+  `data.csc.index.npy`, `indices.csc.index.npy`, `indptr.csc.index.npy`,
+  `params.index.json`, `vocab.index.json` (~200 MB total) +
+  `outputs/bm25_index/ev_ids.txt`. Validates retrieval path can dry-run on
+  Windows without needing AutoDL.
+- **Doc sync**: `TODO.md` rewritten — Step 1 (local BM25) moved to "已完成";
+  remaining AutoDL steps renumbered 1→4. Bottom guidance updated to reflect
+  the new step numbers.
+- **What remains pending (AutoDL only)**: dense index build (bge-m3 on 4080
+  SUPER, ~15 min), Phase 1 baseline eval on `diag_test` (v1 prompt, ~10
+  min), Phase 2 prompt sweep (v2/v3/v4, ~15 min). See `TODO.md` Steps 1-3.
+
+## 2026-05-10/11 — Session 5 (AutoDL boot + Phase 1 scaffolding + bilingual plan)
+
+Catches up the period between Session 4 and today; pushed across commits
+`9465f9b` → `003122a` to `origin/main`.
+
+- **AutoDL instance up**: PyTorch 2.5.1+cu124, RTX 4080 SUPER 31.5 GB VRAM,
+  bf16 + flash-attn 2.x both supported. Smoke test
+  (`scripts/test_qwen35_inference.py`) passes end-to-end with Qwen3.5-4B.
+- **Phase 1 scaffolding** (all green-tested):
+  - `src/prompt.py` — added `PROMPT_VARIANTS` dict with v1 (current baseline)
+    through v4 (each layering one more constraint), all consumed by the new
+    eval harness via `--prompts vN[,vM,...]`.
+  - `scripts/build_indexes.py` — standalone BM25 + dense index builder,
+    `--skip-dense` runs BM25-only (used locally today).
+  - `scripts/phase1_eval.py` — Track 1 (no-RAG) / Track 2 (RAG) × prompt
+    variant sweep harness. Writes `outputs/eval_phase1/track{1,2}_v{1..4}_
+    {dataset}.{json,md}` plus `summary_{dataset}.md`. Per-bucket tables in
+    Track 2 are sorted by HM ascending so weakest buckets surface for
+    Phase 4 targeting.
+  - `scripts/download_models.py` — one-shot fetch of Qwen3.5-4B + bge-m3 +
+    bge-reranker-base + bge-small-en-v1.5 into `models/` (~11 GB).
+- **Persistence refactor**: notebook `cell-1-sft-code` switched to
+  cache-first; all model paths now flow through `MODELS_DIR` +
+  `resolve_model_path()` so `models/` is authoritative on both local and
+  AutoDL.
+- **SFT / DPO data migration**: train + dev_holdout + diag_test rewritten
+  into ms-swift `messages` standard format; all 8 unit-test suites green.
+- **Documentation**:
+  - `design.md` bumped to v1.1 (records D-011 through D-015, where D-015
+    formalises the eval-driven SFT-data-design loop).
+  - `optimization_plan.md` — new 6-phase bilingual (中文 + English) plan,
+    executable counterpart to D-015.
+  - `debug_log.md` Session 2 — Qwen3.5 / AutoDL pitfalls captured (mixed-
+    thinking VL handling, `enable_thinking=False` + thinking-trio, T4 vs
+    4080 dtype gating, transformers 5.x `apply_chat_template` returning
+    `BatchEncoding` not tensor).
+  - `TODO.md` — bilingual single-page recovery doc for tomorrow-self.
+- **Models on disk**: `models/{Qwen3.5-4B,bge-m3,bge-reranker-base,bge-
+  small-en-v1.5}/` — 4 directories, ~11 GB combined.
+
 ## 2026-04-30 — Session 4 (notebook annotated + design.md)
 
 - **Notebook section status badges**: every sub-section header in

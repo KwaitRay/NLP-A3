@@ -3,7 +3,7 @@
 > 单页"明天打开就知道做什么"的快速恢复文档。
 > 完整计划见 `optimization_plan.md`，本文只列**接下来一步要做什么**。
 >
-> 最后更新: 2026-05-11 晚
+> 最后更新: 2026-05-11 晚（本地 BM25 已建好，下一步在 AutoDL）
 
 ---
 
@@ -21,20 +21,13 @@
 - [x] 文档：`design.md` v1.1 (D-011~D-015), `debug_log.md` 会话 2, `optimization_plan.md` (bilingual 6-phase plan)
 - [x] **本地 4 个模型权重全部下载完成**（`models/` 下 ~11 GB）
 - [x] Push 到 `origin/main`（最新 commit `003122a`）
+- [x] **本地 BM25 索引建好**（`outputs/bm25_index/bm25/` 5 个文件，~200 MB）→ 本地 retrieval 现在可 dry-run
 
 ---
 
 ## 🎯 明天的下一步（按顺序）
 
-### Step 1 — 本地：建 BM25 索引（5 分钟，零风险）
-
-```powershell
-python -m scripts.build_indexes --skip-dense
-```
-
-产出 `outputs/bm25_index/` (~200 MB)。这样本地有最小可用 retrieval，之后改代码可本地 dry-run。
-
-### Step 2 — AutoDL：拉新代码 + 同步模型 + 建 dense 索引
+### Step 1 — AutoDL：拉新代码 + 同步模型 + 建 dense 索引
 
 > **为什么 dense 不在本地建**：bge-m3 fp16 要 ~5 GB VRAM，你本地 6 GB 太紧；编码 1.2M 段在 CPU 上慢到不可接受。AutoDL 4080 SUPER 上 ~15 min 完事。
 
@@ -53,7 +46,7 @@ python -m scripts.download_models
 python -m scripts.build_indexes
 ```
 
-### Step 3 — AutoDL：Phase 1 baseline（v1 prompt, ~10 min）
+### Step 2 — AutoDL：Phase 1 baseline（v1 prompt, ~10 min）
 
 ```bash
 python -m scripts.phase1_eval \
@@ -67,7 +60,7 @@ python -m scripts.phase1_eval \
 
 **关键看 `track2_v1_diag_test.md`** —— per-bucket 表已按 HM 升序，**最差的桶在最上面**，那就是 Phase 4 SFT 数据扩充的目标。
 
-### Step 4 — AutoDL：Phase 2 prompt 扫描（v2/v3/v4, ~15 min）
+### Step 3 — AutoDL：Phase 2 prompt 扫描（v2/v3/v4, ~15 min）
 
 ```bash
 python -m scripts.phase1_eval \
@@ -76,7 +69,7 @@ python -m scripts.phase1_eval \
 
 `summary_diag_test.md` 会被覆盖成包含 v1-v4 的对比，看哪个 prompt 在 Track 2 上 HM 最高 → 锁定。
 
-### Step 5 — 把决策填到 `optimization_plan.md` §10
+### Step 4 — 把决策填到 `optimization_plan.md` §10
 
 在决策日志表追加一行：
 ```markdown
@@ -120,4 +113,4 @@ python -m scripts.phase1_eval \
 
 ---
 
-**下次 session 第一句话**：跑 Step 1 → Step 3，把 `summary_diag_test.md` 和 `track2_v1_diag_test.md` per-bucket 表贴回来。
+**下次 session 第一句话**：在 AutoDL 上跑 Step 1 → Step 2，把 `summary_diag_test.md` 和 `track2_v1_diag_test.md` per-bucket 表贴回来。
