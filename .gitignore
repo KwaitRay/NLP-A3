@@ -18,7 +18,15 @@ outputs/sft-out/
 outputs/dpo-out/
 outputs/predictions/
 outputs/smoke/
-models/                    # third-party weights (download via scripts.download_models)
+# Phase 1 prediction dumps — per-claim model outputs, large + regenerable.
+# Eval-report markdowns (track*_*.md, summary_*.md, diagnose_*.md,
+# retrieval_ceiling_*.md) under outputs/eval_phase1/ stay tracked per
+# optimization_plan.md §7.3.
+outputs/eval_phase1/*.json
+# Third-party model weights — downloaded via scripts.download_models on each box.
+# Inline-comment form (`models/ # ...`) doesn't work in .gitignore patterns —
+# must keep the comment on its own line above.
+models/
 *.safetensors
 *.bin
 *.pt
