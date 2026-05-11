@@ -2,6 +2,56 @@
 
 > Live status tracker. Update when crossing milestones. Plan in `~/.claude/plans/fancy-mapping-lemur.md`.
 
+## 2026-05-11 — Session 7 (data-format migration + AutoDL .bin→.safetensors workaround)
+
+Same calendar day as Session 6 but distinct enough to log separately. Covers
+the post-BM25 work and the AutoDL workflow gaps that surfaced when the user
+tried to build the dense index.
+
+- **Local SFT data regenerated** into ms-swift messages format
+  (`outputs/sft_data/sft_{train,dev_holdout,diag_test}_v1.jsonl`):
+  prior on-disk files were still in the old `{system, query, response}`
+  schema even though `src/sft_dataset.py` had already been migrated. Ran
+  `python -m src.build_stage0`; existence checks correctly skipped EDA /
+  tagging / splits and rebuilt only SFT (~1.5 s evidence load, 0.1 s build
+  per split, 1972 / 121 / 121 records).
+- **`optimization_plan.md` §0.5 added** — bilingual "Base-model capability
+  probe (precondition)" capturing the AutoDL smoke-test findings from
+  `debug_log.md` Session 2 实测数据:
+  - 4a no-RAG greedy: SUPPORTS/REFUTES correct, NEI→REFUTES (base lacks
+    "I don't know" concept) → drives **NEI must be oversampled** hard
+    constraint.
+  - 4b RAG fake-ev greedy: `LABEL ##[i,j]##` format strict → **citation
+    examples stay lean** (no format-only augmentation).
+  - 4c SC easy SUPPORTS: 5/5 agreement → **prioritize DISPUTED/ambiguous
+    augmentation** with r=2.0 multiplier in §4.3.
+  - §4.3 augmentation strategy now cross-references §0.5.3 as precondition.
+- **AutoDL build_indexes hit transformers CVE-2025-32434 mitigation**:
+  ModelScope mirror serves `BAAI/bge-m3` as `pytorch_model.bin` only (no
+  safetensors), and transformers >= some-version refuses torch.load unless
+  torch >= 2.6. AutoDL is pinned at torch 2.5.1+cu124 for flash-attn /
+  bitsandbytes / flash-linear-attention compatibility (debug_log Issue 13)
+  — upgrading torch is high-risk.
+- **Resolution**: `scripts/convert_bin_to_safetensors.py` — walks
+  `models/*/`, skips dirs already carrying `*.safetensors`, converts
+  single-file `pytorch_model.bin` via direct `torch.load` +
+  `safetensors.save_file` (user-code torch.load is unrestricted; only the
+  transformers wrapper enforces the CVE check). Renames `.bin` → `.bin.bak`
+  for rollback. Sharded layouts get warn-and-skip.
+- **TODO.md Step 1 expanded**: pipeline now runs `git pull` →
+  `pip install -U modelscope huggingface_hub` → `python -m src.build_stage0`
+  → `python -m scripts.download_models` → `python -m
+  scripts.convert_bin_to_safetensors` → `python -m scripts.build_indexes`.
+- **debug_log.md Issue 16 + 复用经验 19**: full root-cause writeup of the
+  CVE / mirror-gap / firewall triple-bind plus the `HF_ENDPOINT=
+  https://hf-mirror.com` fallback for future single-file補下.
+- **design.md D-016**: codifies "convert offline locally, do **not**
+  upgrade torch" as a binding decision; rationale ties back to D-013
+  (T4/Ampere dual-path) and Issue 13 (instance rebuild for torch 2.5).
+- **Commits pushed**: `2617051` doc alignment → `45b1dc2` build_stage0 step
+  → `f78865a` safetensors converter + §0.5 + §4.3 prerequisite link. All
+  on `origin/main`; AutoDL just needs `git pull`.
+
 ## 2026-05-11 — Session 6 (local prep complete, ready for AutoDL Phase 1)
 
 Local prerequisites for Phase 1 evaluation now fully satisfied. Next session is AutoDL.

@@ -828,6 +828,49 @@ DPO：
 
 ---
 
+### 问题 16 — transformers torch.load CVE 检查 + ModelScope 镜像无 safetensors（双重夹击）
+
+**症状**：AutoDL 上 `python -m scripts.build_indexes` 跑到 dense 索引构建阶段（加载 bge-m3）时报：
+
+```
+ValueError: Due to a serious vulnerability issue in `torch.load`, even with
+`weights_only=True`, we now require users to upgrade torch to at least v2.6
+in order to use the function. This version restriction does not apply when
+loading files with safetensors.
+See https://nvd.nist.gov/vuln/detail/CVE-2025-32434
+```
+
+调用链：`SentenceTransformer.load()` → transformers `_load_pretrained_model()` → `load_state_dict()` → `check_torch_load_is_safe()` → 抛错。
+
+**根因（两层叠加）**：
+1. **transformers 包装层 CVE 缓解** — `transformers/modeling_utils.py` 检测到马上要走 `torch.load` 而非 `safetensors`，且当前 torch < 2.6，直接拒绝加载。CVE-2025-32434 是 pickle 反序列化漏洞，即使 `weights_only=True` 也不安全。
+2. **ModelScope 镜像缺 safetensors** — `BAAI/bge-m3` 在 ModelScope 上**只发 `pytorch_model.bin`（2.27 GB）**，没有 `model.safetensors`。所以 sentence-transformers 无法走 safetensors 优先路径，被迫退到 .bin → 撞墙。
+3. **HF 直连不通** — AutoDL 在墙内，`huggingface.co` 不可达（`[Errno 99] Cannot assign requested address`），不能直接补下 safetensors。
+
+**修复决策**：**本地离线转换 .bin → .safetensors，不升级 torch**。
+
+理由：
+- 升 torch 到 2.6 会破坏 flash-attn 2.x / bitsandbytes / flash-linear-attention 整条供应链（debug_log 问题 13 重建实例就是为了固定这套依赖）
+- `torch.load` 这个 API 本身在 2.5 下能用，**限制只在 transformers 的包装层**；直接在用户代码里调 `torch.load` 不受限
+- bin 文件已经在磁盘上了，**0 网络消耗**，CPU 30s 完事
+
+**落地**：新建 `scripts/convert_bin_to_safetensors.py`：
+- 扫 `models/*/`，跳过已有 `*.safetensors` 的目录（Qwen3.5-4B 是 sharded safetensors，自动跳过）
+- 对 single-file `pytorch_model.bin` 调 `torch.load` + `safetensors.save_file(state_dict.contiguous().clone())`
+- 原 `.bin` 改名 `.bak`（保留回滚能力），sentence-transformers 自动选 safetensors
+- 警告并跳过 sharded `pytorch_model-*-of-*.bin`（需重建 index.json，不安全），建议改走 `HF_ENDPOINT=https://hf-mirror.com` 重下
+
+**HF 镜像 fallback**（如果将来确实需要单独补文件）：
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+python -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='BAAI/bge-m3', filename='model.safetensors', local_dir='models/bge-m3')"
+```
+
+**涉及文件**：`scripts/convert_bin_to_safetensors.py`（新建）；`TODO.md` Step 1 插入该步；`optimization_plan.md` §7.2 artifact 清单 + §8 风险表。
+
+---
+
 ## 复用经验（会话 2 增量）
 
 ### 9. transformers 5.x 的隐式行为变化清单

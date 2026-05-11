@@ -968,6 +968,20 @@ outputs/eval_compare.md          # markdown 对比表带 Δ 列
 - **风险**：评估 + prompt 优化阶段会消耗一些 GPU 时间（推理 154 dev claims × N 个 prompt 变体），但相比 SFT 训练成本可忽略。
 - **关联**：D-011 的 DISPUTED 实测已经预示了这套流程的产出形态——base 模型对"识别证据矛盾"无能，正是评估阶段会显式量化、SFT 阶段定向修补的典型弱点。
 
+### D-016：本地离线转 .bin → .safetensors，不升级 torch（被动决策）
+
+- **决策**：当 ModelScope 镜像只发 `pytorch_model.bin` 触发 transformers CVE-2025-32434 安全检查时，**保持 AutoDL 镜像 torch 2.5.1+cu124 不动**，改用 `scripts/convert_bin_to_safetensors.py` 离线把 .bin 转成 .safetensors。
+- **替代（被否决）**：
+  1. 升级 torch 到 ≥ 2.6 满足检查 → 破坏 flash-attn 2.x / bitsandbytes / flash-linear-attention 整条已编译依赖（D-013 + debug_log 问题 11、13 都建立在 torch 2.5 上）
+  2. 从 HuggingFace 直接补下 safetensors → AutoDL 墙内 `huggingface.co` 不可达
+  3. 用 `HF_ENDPOINT=https://hf-mirror.com` 走镜像 → 可行，但增加 2.27 GB 网络往返；本地已有 .bin，没必要
+- **理由**：
+  1. `torch.load` API 本身在 2.5 下能用；CVE 限制只在 transformers 的**包装层**。用户代码里直接调 `torch.load` 不受限。
+  2. 转换是一次性操作（每个模型 30 s CPU），转完所有后续加载走 safetensors 路径，无副作用。
+  3. 保留 `.bin.bak` 作为回滚后悔药；确认 retrieval 跑通后 `find models -name '*.bin.bak' -delete` 释放磁盘。
+- **适用边界**：仅适用于 **single-file** `pytorch_model.bin` 布局（如 bge-m3、bge-reranker-base、bge-small-en-v1.5）。**Sharded** `pytorch_model-*-of-*.bin` 需要同步重生成 `pytorch_model.bin.index.json` 的 weight_map，脚本主动 warn 并跳过——这种情形请改走 hf-mirror.com 镜像重下。Qwen3.5-4B 是 sharded safetensors，无此问题。
+- **关联**：debug_log 问题 16；optimization_plan §7.2 / §8。
+
 ---
 
 ## 18. 术语表

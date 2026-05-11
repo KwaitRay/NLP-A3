@@ -375,6 +375,7 @@ else:
 | BM25 索引 / index | `outputs/bm25_index/` | ~200 MB | `BM25Retriever.build()` | cell 2.1 ✓ |
 | Dense 索引 / index | `outputs/dense_index/{faiss.index,chunks/}` | ~5 GB | `DenseRetriever.build()` | cell 2.2 ✓（带 faiss.index 二次校验） |
 | **模型权重（统一）/ all model weights** | `models/{Qwen3.5-4B,bge-m3,bge-reranker-base,bge-small-en-v1.5}/` | ~11 GB total | `scripts.download_models` | `paths.resolve_model_path()` ✓ — DenseRetriever / CrossEncoderReranker / phase1_eval / smoke_test 全部自动检测 |
+| **safetensors 转换（bge-* 系列）/ bin→safetensors conversion** | `models/<bge-*>/model.safetensors` + `pytorch_model.bin.bak` | ~2 GB / model | `scripts.convert_bin_to_safetensors` | 跳过已有 `*.safetensors` 的目录；见 §8 风险表 + debug_log 问题 16 |
 | SFT checkpoint | `outputs/sft-out/checkpoint-*/` | ~100-500 MB | ms-swift sft | cell 3.5b: `if SFT_CKPT.exists()` ✓ |
 | DPO checkpoint | `outputs/dpo-out/checkpoint-*/` | ~100-500 MB | ms-swift rlhf | cell 3.5b: `if DPO_CKPT.exists()` ✓ |
 | 推理预测 / predictions | `outputs/predictions/track*.json` | < 1 MB | `evaluate_track()` | (覆盖式 / overwritten each run) |
@@ -425,6 +426,8 @@ AutoDL boxes; submission zip carries only small artifacts.
 | Phase 5 训练 8h 超时 / training timeout | 中 / med | `--save_steps 200` + `resume_from_checkpoint`（已配置 / configured） |
 | Phase 6 official_dev 数字比 diag_test 差很多 / official_dev underperforms | 中 / med | 说明 diag_test 不能完全代理 official_dev 分布；只在 final report 诚实说明 |
 | 部分弱桶 n < 5（统计噪声）/ small-n buckets are noisy | 高 / high | 弱桶判定加 `n >= 5` 门槛（§4.2 已规定） |
+| ModelScope 镜像缺 safetensors → transformers CVE-2025-32434 拒绝 .bin / mirror gap blocks .bin load on torch<2.6 | 已发生 / observed | `python -m scripts.convert_bin_to_safetensors` 本地离线转换；**不**升级 torch（会破坏 flash-attn 2.x 编译）；见 debug_log 问题 16 + design.md D-016 |
+| AutoDL 墙内 HF 直连不通（`[Errno 99]`） / HF unreachable from AutoDL | 已发生 / observed | `export HF_ENDPOINT=https://hf-mirror.com` 走镜像；优先 ModelScope，HF 仅作 fallback |
 
 ---
 
@@ -439,9 +442,13 @@ AutoDL boxes; submission zip carries only small artifacts.
 - [x] cell-1-sft-code 升级为 cache-first（同时建三份数据）
 - [x] `requirements.txt` 加 AutoDL Quick Start
 - [x] AutoDL 4080 SUPER 实例 + 模型 + smoke test 通过
+- [x] 本地 BM25 索引（`outputs/bm25_index/`, ~200 MB）
+- [x] 本地 SFT 数据迁移到 messages 格式（重跑 `src.build_stage0`）
+- [x] §0.5 base 模型能力探针写入 plan（4a-4c 实测 → SFT 数据三条硬约束）
+- [x] `scripts/convert_bin_to_safetensors.py`（应对 ModelScope 缺 safetensors + transformers CVE-2025-32434）
 
 ### 进行中 / In progress
-- [ ] AutoDL 上 build BM25 + dense 索引
+- [ ] AutoDL 上 `git pull` + `convert_bin_to_safetensors` + `build_indexes`（dense）
 - [ ] Phase 1 baseline 评估（v1 on diag_test）
 
 ### 待做 / Todo
