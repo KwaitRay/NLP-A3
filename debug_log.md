@@ -1229,5 +1229,58 @@ outputs/model_cache/Qwen/Qwen3___5-4B   # 旧的，已 stale
 
 **新代码约定**：模型目录名 = repo basename（`Qwen/Qwen3.5-4B` → `Qwen3.5-4B`），由 `paths.resolve_model_path()` 统一解析，**不要硬编码 `outputs/model_cache/<owner>/<basename>` 路径**（那是 ModelScope 内部细节，不稳定）。
 
+### 27. ms-swift 4.2.0 的 FSDP2 import vs AutoDL torch 2.5.1 — 不降版本，只 patch 一行
+
+**症状**（2026-05-12 SFT 启动时）：
+
+```
+ImportError: cannot import name 'FSDPModule' from 'torch.distributed.fsdp'
+  (/root/miniconda3/lib/python3.12/site-packages/torch/distributed/fsdp/__init__.py)
+```
+
+栈底：`swift/callbacks/activation_cpu_offload.py:4` 触发，链路：
+
+```
+swift.callbacks/__init__.py → from .mapping import callbacks_map
+swift.callbacks.mapping     → from .activation_cpu_offload import ActivationCpuOffloadCallBack
+swift.callbacks.activation_cpu_offload → from torch.distributed.fsdp import FSDPModule as FSDP2
+```
+
+**根因**：`FSDPModule` 是 **torch 2.6+** 才暴露的 API。ms-swift 4.2.0 给 activation CPU offload 加 callback 时假设 torch ≥ 2.6，没做向后兼容。AutoDL 标准镜像锁在 torch 2.5.1+cu124（问题 13 选定的，flash-attn 2.x / bitsandbytes / fla 全栈靠它）。
+
+**关键决策：不降 ms-swift，不升 torch**。
+
+| 路径 | 改动 | 风险 |
+|---|---|---|
+| 降 ms-swift（试过 `<4.2`）| 装到了用 `swift/llm/` 老模块路径的更早版本 | 丢 `--tuner_type` / `--enable_thinking` / `--add_non_thinking_prefix` —— 我们 Phase 4 训练命令全部用这些，相当于回到 debug_log 问题 9 的初态 |
+| 升 torch 到 2.6+ | flash-attn 2.x / bitsandbytes / fla 全栈要重测；问题 13 重建实例的努力作废 | 高 |
+| **patch FSDP2 import 为可选**（采纳） | `scripts/patch_swift_fsdp2.py` 一行 try/except + stub 类 | 极低 — callback 不用就不会实例化 stub |
+
+`materials/qwen3.5_key_points.docx` 推荐 latest ms-swift + flash-attn 2.8.3 + transformers 5.2.* + python 3.12，**隐含假设 torch 2.6+**（但没明说）。`materials/swift版本适配.docx` 列出版本矩阵，torch 2.5.x 行推荐 swift 配 vLLM 加速场景，FSDP2 是 2.6+ 才的特性。
+
+**修复**：`scripts/patch_swift_fsdp2.py`
+
+- 扫 `swift/**/*.py` 找到所有 module-load 期就 import `FSDPModule` 的文件（当前 4.2.0 只有一处）
+- 把单行 `from torch.distributed.fsdp import FSDPModule as FSDP2` 包成：
+
+  ```python
+  try:
+      from torch.distributed.fsdp import FSDPModule as FSDP2
+  except ImportError:
+      class FSDP2:  # stub for torch<2.6
+          pass
+  ```
+
+- 用一个 sentinel comment (`torch < 2.6 fallback. The class is only used by`) 标记已 patch 状态 → 幂等
+- 最后 `importlib.import_module("swift.callbacks")` 自检通过
+
+**集成到 notebook**：`cell-setup-2` pip install 完后自动 `os.system(f"{sys.executable} -m scripts.patch_swift_fsdp2")` —— **新建 AutoDL 实例不再撞这个坑**。
+
+**复用要点**：
+
+1. ms-swift 任何 callback 撞老 torch API 时同样可用此模式（扫 + try/except + stub）
+2. 看 `materials/swift版本适配.docx` 的版本矩阵确认 torch 与 ms-swift 哪个特性绑哪个 torch 版本
+3. **不要因为单个文件 import 失败就降整个库** —— 看清楚 callback 是不是真用得到（90% 训练命令用不到 FSDP / activation offload），patch 一行远比降版本干净
+
 
 
