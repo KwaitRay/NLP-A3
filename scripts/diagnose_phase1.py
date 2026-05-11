@@ -57,8 +57,26 @@ EVAL_DIR = OUTPUTS_DIR / "eval_phase1"
 _FN_RE = re.compile(r"^track(?P<track>\d+)_(?P<prompt>[^_]+)_(?P<dataset>.+)\.json$")
 
 
-def _load_gold(dataset: str) -> dict[str, dict]:
-    """Return ``{claim_id: {claim_label, claim_text, evidences}}``."""
+_K_SUFFIX_RE = re.compile(r"_k\d+$")
+
+
+def _strip_k_suffix(dataset_label: str) -> str:
+    """``diag_test_k20`` -> ``diag_test``.
+
+    phase1_eval.py adds the ``_k{N}`` suffix to output filenames when
+    ``--final-k`` is non-default. The underlying gold split is the same,
+    so we strip the suffix before looking it up.
+    """
+    return _K_SUFFIX_RE.sub("", dataset_label)
+
+
+def _load_gold(dataset_label: str) -> dict[str, dict]:
+    """Return ``{claim_id: {claim_label, claim_text, evidences}}``.
+
+    ``dataset_label`` may carry a ``_k{N}`` suffix from phase1_eval's
+    ``--final-k`` mode; we strip it before reading the splits file.
+    """
+    dataset = _strip_k_suffix(dataset_label)
     if dataset == "official_dev":
         return load_dev()
     path = SPLITS_DIR / f"{dataset}.jsonl"
@@ -371,7 +389,9 @@ def _render_summary_table(rows: list[dict]) -> str:
 def main() -> None:
     p = argparse.ArgumentParser(description="Phase 1 prediction diagnostic")
     p.add_argument("--dataset", default="diag_test",
-                   choices=["diag_test", "dev_holdout", "official_dev"])
+                   help="Base name (diag_test / dev_holdout / official_dev) or "
+                        "a suffixed label such as 'diag_test_k20' to inspect "
+                        "phase1_eval runs from a non-default --final-k.")
     p.add_argument("--tracks", default=None,
                    help="Comma-separated track ids (default: all found on disk).")
     p.add_argument("--prompts", default=None,

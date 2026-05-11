@@ -148,13 +148,13 @@ def render_per_bucket(
 
 
 def write_run_report(
-    track: int, prompt: str, dataset: str,
+    track: int, prompt: str, dataset_label: str,
     preds: dict, gold: dict, tag_lookup: dict, elapsed: float,
 ) -> Path:
     overall = score_predictions(preds, gold)
-    out_md = OUT_DIR / f"track{track}_{prompt}_{dataset}.md"
+    out_md = OUT_DIR / f"track{track}_{prompt}_{dataset_label}.md"
     parts = [
-        f"# Track {track} — prompt {prompt} on {dataset}",
+        f"# Track {track} — prompt {prompt} on {dataset_label}",
         "",
         f"- variant: **{PROMPT_VARIANTS[prompt]['name']}** ({PROMPT_VARIANTS[prompt]['description']})",
         f"- claims: {overall['n']}",
@@ -173,11 +173,11 @@ def write_run_report(
 
 # -- Cross-prompt summary ---------------------------------------------------
 
-def write_summary(results: list[dict], dataset: str) -> Path:
+def write_summary(results: list[dict], dataset_label: str) -> Path:
     """One-table summary of all (track, prompt) combinations."""
-    out_md = OUT_DIR / f"summary_{dataset}.md"
+    out_md = OUT_DIR / f"summary_{dataset_label}.md"
     lines = [
-        f"# Phase 1 summary on {dataset}",
+        f"# Phase 1 summary on {dataset_label}",
         "",
         "Prompt variant sweep (D-015 Phase 2). Higher HM is better.",
         "Track 1 = no-RAG (base model parametric only). Track 1 F is 0 by design.",
@@ -209,7 +209,7 @@ def write_summary(results: list[dict], dataset: str) -> Path:
 
 # -- Pipeline init ---------------------------------------------------------
 
-def build_pipeline(evidence: dict):
+def build_pipeline(evidence: dict, *, final_k: int = 5):
     from src.retrieval.bm25 import BM25Retriever
     from src.retrieval.dense import DenseRetriever
     from src.retrieval.pipeline import RetrievalPipeline, RetrievalConfig
@@ -240,7 +240,7 @@ def build_pipeline(evidence: dict):
         use_bm25=True, use_dense=dense is not None,
         use_rerank=reranker is not None,
         use_rule_reorder=False,  # rule_reorder needs spaCy; skip in eval
-        final_k=5,
+        final_k=final_k,
     )
     return RetrievalPipeline(
         evidence_corpus=evidence, bm25=bm25, dense=dense, reranker=reranker, cfg=cfg,
@@ -296,6 +296,11 @@ def main():
                    help="Local model snapshot. Omit to download from ModelScope.")
     p.add_argument("--limit", type=int, default=None,
                    help="Cap claims for quick smoke (e.g. --limit 30).")
+    p.add_argument("--final-k", type=int, default=5,
+                   help="Top-k evidences shown to the model in Track 2 RAG. "
+                        "Phase 3.5 audit (`scripts.retrieval_ceiling --mode final_k`) "
+                        "showed recall@5=0.119 but recall@20=0.333; try --final-k 20 "
+                        "to verify end-to-end HM lift.")
     args = p.parse_args()
 
     tracks = [int(x) for x in args.tracks.split(",")]
@@ -305,7 +310,17 @@ def main():
             raise SystemExit(f"unknown prompt version: {v}; available: {list(PROMPT_VARIANTS)}")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"=== Phase 1 eval: tracks={tracks} prompts={prompts} dataset={args.dataset} ===")
+    # When --final-k differs from production default (5), suffix output filenames
+    # so we don't clobber the k=5 baseline tables. diagnose_phase1.py strips the
+    # suffix when looking up the gold split.
+    dataset_label = (
+        args.dataset if args.final_k == 5 else f"{args.dataset}_k{args.final_k}"
+    )
+    print(f"=== Phase 1 eval: tracks={tracks} prompts={prompts} "
+          f"dataset={args.dataset} final_k={args.final_k} ===")
+    if dataset_label != args.dataset:
+        print(f"  outputs will be written as track*_*_{dataset_label}.* "
+              f"(non-default final_k → suffixed to preserve baseline)")
 
     print("\n[1/4] loading dataset...")
     gold, tag_lookup = load_dataset(args.dataset)
@@ -321,14 +336,15 @@ def main():
     if 2 in tracks:
         print("\n[3/4] loading evidence corpus + RAG pipeline...")
         evidence = load_evidence(show_progress=True)
-        pipeline = build_pipeline(evidence)
+        pipeline = build_pipeline(evidence, final_k=args.final_k)
         print(f"  evidence: {len(evidence):,} passages")
+        print(f"  RAG final_k = {args.final_k}")
 
     print("\n[4/4] running track × prompt sweep...")
     results: list[dict] = []
     for track in tracks:
         for prompt in prompts:
-            tag = f"track{track}_{prompt}_{args.dataset}"
+            tag = f"track{track}_{prompt}_{dataset_label}"
             print(f"\n--- {tag} ---")
             t0 = time.time()
             if track == 1:
@@ -343,14 +359,14 @@ def main():
             json_path = OUT_DIR / f"{tag}.json"
             json_path.write_text(json.dumps(preds, ensure_ascii=False, indent=2), encoding="utf-8")
 
-            md_path = write_run_report(track, prompt, args.dataset, preds, gold, tag_lookup, elapsed)
+            md_path = write_run_report(track, prompt, dataset_label, preds, gold, tag_lookup, elapsed)
             metrics = score_predictions(preds, gold)
             print(f"  → F={metrics['f_score']:.4f}  Acc={metrics['accuracy']:.4f}  "
                   f"HM={metrics['harmonic_mean']:.4f}  ({elapsed:.1f}s)")
             print(f"  → {md_path}")
             results.append({"track": track, "prompt": prompt, "metrics": metrics})
 
-    summary_path = write_summary(results, args.dataset)
+    summary_path = write_summary(results, dataset_label)
     print(f"\n=== Summary written to {summary_path} ===\n")
     print(summary_path.read_text(encoding="utf-8"))
 
