@@ -1,0 +1,95 @@
+# COMP90042 Assignment 3 — Hybrid RAG Climate Fact-Checker
+# ════════════════════════════════════════════════════════════════════════════
+#
+# **torch 2.6+ 专用** 依赖锁定。当前 AutoDL（torch 2.5.1）用 `requirements.txt`。
+# 本文件适用场景：
+#   - A100 / H100 集群（torch 2.6/2.7 standard）
+#   - 未来 AutoDL 升级到 torch 2.6+ 镜像
+#   - 任何 torch >= 2.6 的环境（FSDP2 native，不需要 patch_swift_fsdp2）
+#
+# 与 requirements.txt 唯一的实质差异：
+#   - ms-swift 不锁版本（取最新；FSDP2 import 在 torch 2.6+ 原生支持）
+#   - 推荐装 flash-attn 2.8.3（Ampere+ 上 standard self-attention 加速）
+#
+# 其余包（transformers / qwen_vl_utils / peft / ...）pin 与 r.txt 完全相同，
+# 因为 Qwen3.5 model_type 在 transformers 5.2.* 才注册，无关 torch 版本。
+#
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Quick Start：
+# ─────────────
+#   # 1. 确认环境
+#   python -c "import torch; assert torch.__version__.startswith(('2.6', '2.7', '2.8'))"
+#
+#   # 2. 安装依赖
+#   pip install -r requirements-torch26.txt
+#   # （无需跑 scripts.patch_swift_fsdp2 —— torch 已 native 支持 FSDPModule）
+#
+#   # 3. 装 NLP 资源
+#   python -m spacy download en_core_web_sm
+#   python -c "import nltk; nltk.download('wordnet'); nltk.download('omw-1.4')"
+#
+#   # 4. 后续步骤与 requirements.txt 完全一致：
+#   #    scripts.download_models → scripts.test_qwen35_inference →
+#   #    scripts.build_indexes → scripts.phase1_eval
+#
+# ────────────────────────────────────────────────────────────────────────────
+
+# ── 训练框架（Qwen3.5 SFT + DPO via ms-swift）────────────
+# torch 2.6+ 上 ms-swift 任何版本（4.2+）都能直接 import，无需 patch。
+# 推荐 4.2.0 是当前 materials/qwen3.5_key_points.docx 测过的版本；放开 >=
+# 让 pip 取最新。如果未来 ms-swift 出 5.x major bump，先去 debug_log 确认
+# CLI flag 没倒退（--tuner_type / --enable_thinking 等）。
+ms-swift>=4.2.0
+modelscope>=1.20.0
+transformers==5.2.*            # ← Qwen3.5 必需，与 torch 版本无关
+qwen_vl_utils>=0.0.14
+peft>=0.14.0
+trl>=0.12.0
+accelerate>=1.0.0
+bitsandbytes>=0.45.0
+liger-kernel>=0.5.0
+
+# ── 检索 ───────────────────────────────────────────────
+sentence-transformers>=3.0.0
+bm25s>=0.2.0
+pystemmer>=2.2.0
+faiss-cpu>=1.7.4
+
+# ── NLP 工具 ────────────────────────────────────────────
+spacy>=3.7.0
+nltk>=3.9.0
+
+# ── 数据处理 / 评测 ─────────────────────────────────────
+numpy>=1.24,<2.0
+scipy>=1.11.0
+scikit-learn>=1.3.0
+pandas>=2.0.0
+tqdm>=4.66.0
+
+# ── Notebook 运行时 ─────────────────────────────────────
+jupyter>=1.0.0
+ipykernel>=6.25.0
+ipywidgets>=8.0.0
+
+# ── Dev / 仓库卫生 ───────────────────────────────────────
+nbstripout>=0.7.0
+python-docx>=1.0.0
+
+# ──────────────────────────────────────────────────────────
+# 推荐加速（torch 2.6+ 上更稳，可以直接装）
+# ──────────────────────────────────────────────────────────
+#
+# 1. flash-attn 2.8.3（Ampere+ 的标准 self-attention 加速）
+#    materials/qwen3.5_key_points.docx 推荐版本，torch 2.6+ 上 wheel 充足，
+#    通常 < 30s 装好。设置 `--attn_impl flash_attention_2` 在 SFT CLI 启用。
+#      pip install "flash-attn==2.8.3" --no-build-isolation
+#
+# 2. flash-linear-attention（Qwen3.5 GatedDeltaNet 的 fast path）
+#      pip install -U "flash-linear-attention>=0.4.2" --no-build-isolation
+#
+# 3. causal-conv1d（fla 的配套 kernel）
+#      pip install -U "git+https://github.com/Dao-AILab/causal-conv1d" --no-build-isolation
+#
+# 4. deepspeed（多卡 ZeRO；single-GPU 不需要）
+#      pip install deepspeed

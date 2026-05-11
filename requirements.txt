@@ -1,33 +1,48 @@
 # COMP90042 Assignment 3 — Hybrid RAG Climate Fact-Checker
 # ════════════════════════════════════════════════════════════════════════════
 #
+# 此文件 = **torch 2.5.1 / 当前 AutoDL 镜像** 的 production 依赖锁定。
+# 如果你在 torch 2.6+ 环境（A100 集群 / 未来 AutoDL 升级），用
+# `requirements-torch26.txt` 代替本文件 —— 它放开 ms-swift 版本并允许
+# FSDP2 native，不需要 patch_swift_fsdp2 后处理。
+#
+# ════════════════════════════════════════════════════════════════════════════
+#
 # AutoDL Quick Start（按顺序）:
 # ─────────────────────────────
 #   # 1. 创建实例时选 PyTorch 2.5.1 + CUDA 12.4 + Python 3.12 镜像（实测稳定）
 #   #    其他镜像 cu130 等会撞 driver 12.6 上限，详见 debug_log.md 问题 13
 #
-#   # 2. 拉代码 + 装依赖（国内源加速）
+#   # 2. 拉代码 + 装依赖（国内源加速 + AutoDL 学术加速）
+#   source /etc/network_turbo
 #   cd ~/autodl-tmp && git clone https://github.com/<you>/NLP-A3.git && cd NLP-A3
 #   pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+#
+#   # 3. **必做**：patch ms-swift 4.2.0 的 FSDP2 import（torch<2.6 兼容）
+#   #    详见 debug_log.md 复用经验 27
+#   python -m scripts.patch_swift_fsdp2
+#
+#   # 4. 装 NLP 资源（spacy 走 turbo 拉 github releases）
+#   source /etc/network_turbo
 #   python -m spacy download en_core_web_sm
 #   python -c "import nltk; nltk.download('wordnet'); nltk.download('omw-1.4')"
 #
-#   # 3. （可选）装 SFT 训练加速 kernel — Phase 1 评估不需要
+#   # 5. （可选）SFT 训练加速 kernel — Phase 1 评估不需要
 #   pip install -U "flash-linear-attention>=0.4.2" --no-build-isolation
 #   pip install -U "git+https://github.com/Dao-AILab/causal-conv1d" --no-build-isolation
 #
-#   # 4. 一次性下载所有模型权重到 models/ (~11 GB)
+#   # 6. 一次性下载所有模型权重到 models/ (~11 GB)
 #   #    Qwen3.5-4B (8GB) + bge-m3 (2GB) + bge-reranker-base (1GB) + bge-small (130MB)
 #   python -m scripts.download_models
 #   #    选择性下载: --only qwen / --skip qwen / --only bge-m3,bge-reranker-base
 #
-#   # 5. Smoke test —— 5 分钟验证模型/推理路径/SC 行为（自动用 models/ 里的本地副本）
+#   # 7. Smoke test —— 5 分钟验证模型/推理路径/SC 行为（自动用 models/ 里的本地副本）
 #   python -m scripts.test_qwen35_inference
 #
-#   # 6. 建检索索引（一次性 ~30-45 min）
+#   # 8. 建检索索引（一次性 ~30-45 min）
 #   python -m scripts.build_indexes
 #
-#   # 7. Phase 1 评估 —— Track 1/2 × prompt 变体扫描（~15 min）
+#   # 9. Phase 1 评估 —— Track 1/2 × prompt 变体扫描（~15 min）
 #   python -m scripts.phase1_eval --tracks 1,2 --prompts v1,v2,v3,v4 \
 #       --dataset diag_test
 #   # 输出在 outputs/eval_phase1/，看 summary_diag_test.md
@@ -44,9 +59,17 @@
 # 推荐镜像：PyTorch 2.5.1 + CUDA 12.4 + Python 3.12（实测稳定，2026-05）。
 
 # ── 训练框架（Qwen3.5 SFT + DPO via ms-swift）────────────
-ms-swift>=3.0.0                # CLI 路径 swift/pipelines/train/sft.py，参数名见 design.md §8.6
+# ms-swift==4.2.0 锁定：4.2.0 是 materials/qwen3.5_key_points.docx 推荐
+# 的版本，含 --tuner_type / --enable_thinking / --add_non_thinking_prefix /
+# --loss_scale 等 Qwen3.5 必备 CLI flag。但它在 swift/callbacks/
+# activation_cpu_offload.py 导入 torch.distributed.fsdp.FSDPModule（torch
+# 2.6+ API），在 torch 2.5.1 上 import 即 crash。
+# 解决：pip install 后**必须**跑 `python -m scripts.patch_swift_fsdp2`
+# 把那一行包成 try/except + stub（callback 用不到无害）。详见 debug_log
+# 复用经验 27。torch 2.6+ 环境用 requirements-torch26.txt 跳过这一步。
+ms-swift==4.2.0
 modelscope>=1.20.0             # Qwen3.5 模型来源（HuggingFace 上没 base 版本）
-transformers==5.2.*            # ← Qwen3.5 必需：5.1 缺模型类，5.3 视频 dataloader 坏（per qwen3.5_key_points.docx）
+transformers==5.2.*            # ← Qwen3.5 必需：5.1 缺 qwen3_5 model_type，5.3 视频 dataloader 坏（per qwen3.5_key_points.docx）
 qwen_vl_utils>=0.0.14          # ← Qwen3.5 是 mixed-thinking VL 模型，加载时即检查
 peft>=0.14.0                   # LoRA / QLoRA adapter
 trl>=0.12.0                    # ms-swift DPO 后端
@@ -61,8 +84,8 @@ pystemmer>=2.2.0               # bm25s 词干处理
 faiss-cpu>=1.7.4               # 稠密索引；GPU 版需 conda install -c pytorch faiss-gpu
 
 # ── NLP 工具 ────────────────────────────────────────────
-spacy>=3.7.0                   # NER 实体抽取（rule reorder 用）
-nltk>=3.9.0                    # WordNet 同义词扩展
+spacy>=3.7.0                   # NER 实体抽取（rule reorder 用，eval 时 use_rule_reorder=False 跳过）
+nltk>=3.9.0                    # WordNet 同义词扩展（src/query_rewrite.synonym_expand）
 
 # ── 数据处理 / 评测 ─────────────────────────────────────
 numpy>=1.24,<2.0               # transformers 5.x 兼容 numpy 1.26.x，2.0 仍有 import 警告
@@ -75,6 +98,10 @@ tqdm>=4.66.0
 jupyter>=1.0.0
 ipykernel>=6.25.0
 ipywidgets>=8.0.0              # tqdm 进度条 + transformers 显示
+
+# ── Dev / 仓库卫生 ───────────────────────────────────────
+nbstripout>=0.7.0              # `nbstripout --install` 后 git add 自动剥 jupyter outputs / execution_count，避免 AutoDL 拉/推 notebook 时常年 dirty
+python-docx>=1.0.0             # 读 materials/*.docx 参考文档（ms-swift 官方训练指南 / qwen3.5 实战）
 
 # ──────────────────────────────────────────────────────────
 # 可选加速（不在 pip install -r 自动装；按需手动）
@@ -94,9 +121,9 @@ ipywidgets>=8.0.0              # tqdm 进度条 + transformers 显示
 #
 # 3. flash-attn 2.x（标准 self-attention 加速）
 #    **不要在 T4/V100 等 Turing 架构上装**：要求 SM ≥ 8.0 (Ampere+)。
-#    Ampere+ 上可选装：
-#      pip install "flash-attn>=2.6,<3.0" --no-build-isolation
-#    本项目不依赖：transformers 默认 sdpa attention 在 Turing/Ampere 上都工作良好。
+#    Ampere+ 上可选装（materials/qwen3.5_key_points.docx 推荐 2.8.3）：
+#      pip install "flash-attn==2.8.3" --no-build-isolation
+#    本项目不强依赖：transformers 默认 sdpa attention 在 Turing/Ampere 上都工作良好。
 #
 # 4. deepspeed（多卡 ZeRO，与本项目 single-GPU 设定无关）
 #      pip install deepspeed
