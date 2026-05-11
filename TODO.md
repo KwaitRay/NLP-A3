@@ -27,9 +27,11 @@
 
 ## 🎯 明天的下一步（按顺序）
 
-### Step 1 — AutoDL：拉新代码 + 同步模型 + 建 dense 索引
+### Step 1 — AutoDL：拉新代码 + 重生成 SFT 数据 + 同步模型 + 建 dense 索引
 
 > **为什么 dense 不在本地建**：bge-m3 fp16 要 ~5 GB VRAM，你本地 6 GB 太紧；编码 1.2M 段在 CPU 上慢到不可接受。AutoDL 4080 SUPER 上 ~15 min 完事。
+>
+> **为什么要重跑 `build_stage0`**：`outputs/sft_data/*.jsonl` 和 `evidence.json` 都在 `.gitignore` 里，`git pull` 拉不到。AutoDL 上必须本地重生成一份 messages-format 的 SFT 数据（~5s，前提：AutoDL 上已有 `data/evidence.json`）。
 
 ```bash
 # 在 AutoDL 上
@@ -38,6 +40,9 @@ git pull origin main
 
 # 装新依赖（modelscope 已装；huggingface_hub 应该 transformers 自带）
 pip install -U modelscope huggingface_hub  # 保险起见
+
+# 重生成 SFT 数据（messages 格式；前提 data/evidence.json 已就位）
+python -m src.build_stage0
 
 # 一键下所有模型到 models/（如果之前 outputs/model_cache 下过 Qwen，--skip qwen）
 python -m scripts.download_models
