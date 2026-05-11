@@ -3,7 +3,7 @@
 > 单页"明天打开就知道做什么"的快速恢复文档。
 > 完整计划见 `optimization_plan.md`，本文只列**接下来一步要做什么**。
 >
-> 最后更新: 2026-05-12（Phase 1+2 done, 检索天花板发现 → Phase 3.5 优化）
+> 最后更新: 2026-05-12 晚（Phase 3.5 done, final_k=20 锁定, Phase 4 weak_buckets 实现）
 
 ---
 
@@ -30,7 +30,15 @@
 - [x] **Phase 2 prompt sweep 完成**：v1 锁定。v2/v3/v4 全部回退（v3 REFUTES→0）
 - [x] **关键发现：检索天花板 evidence recall ≈ 0.11**（v1-v4 全部一样，与 prompt 无关）
   - F-score 当前架构硬上限 ≈ 0.12，HM 硬上限 ≈ 0.21
-  - **SFT 之前必须先做 Phase 3.5 检索优化**（见下方 Step 4）
+- [x] **Phase 3.5 检索审计 + final_k 端到端实测**
+  - recall@k 曲线：5→0.119 / 10→0.210 / 20→0.333 / 50→0.485 / 100→0.579
+  - 端到端 Track 2 v1 HM：k=5 0.183 / k=10 0.196 / **k=20 0.203**
+  - **锁定 `final_k=20`**：`RetrievalConfig.final_k` default 改了 + `phase1_eval --final-k` default 20
+  - 副作用：k=20 NEI acc 0.025（base 模型几乎不输出 NEI） — 正好是 Phase 4 weak_buckets 要修的
+- [x] **Phase 4 `weak_buckets` 实现 + 测试**
+  - `build_dataset(..., weak_buckets={...})` 支持 (axis, bucket) → factor 配比，多匹配取 max
+  - `build_stage0` 内置 `{nei_underspec:4, disputed_conflict:2, refutes_clear:2}`
+  - 输出 `sft_*_v2.jsonl`（k=20，train 含 weak_buckets 倾斜，v1 保留 ablation）
 
 ---
 
@@ -60,43 +68,73 @@ RAG 部分补救。详见 `outputs/eval_phase1/diagnose_diag_test.md`。
 
 v1 锁定。`summary_diag_test.md` 含完整 v1-v4 对比。v2/v3/v4 全部回退。
 
-### 🎯 Step 4 — Phase 3.5 检索天花板审计 (**明天第一步**)
+### ✅ Step 4 — Phase 3.5 检索天花板审计 (已完成)
 
-> **为什么先做这个**：evidence recall ≈ 0.11 → F-score 当前架构硬上限 ≈ 0.12。
-> Phase 4 SFT 哪怕把 label 提到 100% 正确，HM 也只能到 ≈ 0.21。先把检索拉起来，
-> SFT 红利才能兑现。详见 `optimization_plan.md` §3.5。
+`scripts.retrieval_ceiling --mode final_k` + 端到端 k=5/10/20 实测。
+锁定 `final_k=20`。详见 `outputs/eval_phase1/retrieval_ceiling_diag_test.md`。
 
-```bash
-# AutoDL 上 — 全模式扫描，~3 min（纯检索，无 LLM）
-python -m scripts.retrieval_ceiling --dataset diag_test --mode all
+### ✅ Step 5a — Phase 4 weak_buckets 实现 (已完成，代码 + tests 全绿)
 
-# 看产出
-cat outputs/eval_phase1/retrieval_ceiling_diag_test.md
-```
+`build_dataset` 加参数；`build_stage0` 内置 Phase 4 配比；tests pass。
 
-四个 mode 会跑：
-- **final_k**：5→10→20→50→100 看 recall 曲线（最可能的快速胜：现在 `final_k=5` 太紧）
-- **retriever**：BM25-only / dense-only / fused / +rerank 看哪个组件贡献最大
-- **fusion_w**：w_bm25 ∈ {0.1, 0.3, 0.5, 0.7, 0.9}（当前 0.3 偏 dense）
-- **synonym_expand**：claim vs claim + WordNet 同义词 multi-query union
-
-读 `retrieval_ceiling_diag_test.md` 的 "Best Overall" 段，把最佳配置写回
-`optimization_plan.md` §10 决策日志 + `RetrievalConfig` 调用处。
-
-### Step 5 — 用新检索配置重建 SFT 数据 + 跑 Phase 4
+### 🎯 Step 5b — 重建 SFT 数据 (**AutoDL 下一步，~5 s**)
 
 ```bash
-# 备份当前 v1 数据
-cp -r outputs/sft_data outputs/sft_data.v1_backup
+cd ~/autodl-tmp/NLP-A3
+git pull origin main
 
-# 在 src/retrieval/pipeline.py 改默认 RetrievalConfig，或者
-# 在 src/sft_dataset.py 用 RetrievalConfig 重建
-python -m src.build_stage0 --force  # 重生成 sft_train_v2.jsonl
+# v1 文件保留作 ablation；force 重建生成 v2
+python -m src.build_stage0 --force
+
+# 验证 v2 文件 + NEI 类样本占比
+ls -la outputs/sft_data/sft_*_v2.jsonl
+python -c "
+import json
+rows = [json.loads(l) for l in open('outputs/sft_data/sft_train_v2.jsonl')]
+print(f'total: {len(rows)} records')
+from collections import Counter
+labels = [r['messages'][2]['content'].split()[0] for r in rows if 'messages' in r]
+c = Counter(labels)
+for k, v in c.most_common():
+    print(f'  {k:20s} {v:5d}  {v/len(rows):.3f}')
+"
 ```
 
-之后再走 Phase 4 弱桶配比（见 `optimization_plan.md` §4）。
+预期：
+- v1 train 1972 records → v2 train ~3500 records（NEI 类 ×4 + DISPUTED/REFUTES ×2）
+- NEI 类占比从 ~25% → ~40% (target: 让模型看够"无关 ev → NEI"信号)
 
-### Step 6 — Phase 5 训练 + 评估（不变）
+### 🎯 Step 6 — Phase 5 训练（SFT v2 + DPO）
+
+SFT 配置详见 `optimization_plan.md §5.1`。`cell-2-sft-train` 的 `DATA_PATH`
+指向 `outputs/sft_data/sft_train_v2.jsonl`，跑 ~25-35 min on 4080 SUPER。
+
+```bash
+# ms-swift CLI（参考 notebook cell-2-sft-train，已在 debug_log Issue 9-12 调通）
+swift sft \
+    --model outputs/model_cache/Qwen/Qwen3___5-4B \
+    --dataset outputs/sft_data/sft_train_v2.jsonl \
+    --tuner_type lora --quant_bits 4 \
+    --enable_thinking false --add_non_thinking_prefix true \
+    --loss_scale ignore_empty_think \
+    --bf16 true --use_liger_kernel true \
+    --group_by_length true --save_total_limit 3 \
+    --output_dir outputs/sft-out
+```
+
+训练完拿到 LoRA adapter 后跑端到端评估：
+
+```bash
+# 需要给 phase1_eval 加 --sft-adapter flag（下一轮再写）
+python -m scripts.phase1_eval --tracks 2 --prompts v1 --dataset diag_test \
+    --sft-adapter outputs/sft-out/checkpoint-final
+python -m scripts.diagnose_phase1 --dataset diag_test
+```
+
+读 confusion matrix 比对 pre-SFT vs post-SFT：
+- **目标 1**：NEI acc 0.025 → ≥ 0.40（硬约束 1 兑现）
+- **目标 2**：non-NEI acc 0.580 不掉 5pp 以上
+- **目标 3**：总 HM 从 0.203 → ≥ 0.28
 
 详见 `optimization_plan.md` §5。
 
@@ -161,4 +199,4 @@ python -m scripts.build_indexes
 
 ---
 
-**下次 session 第一句话**：在 AutoDL 上跑 `python -m scripts.retrieval_ceiling --dataset diag_test --mode all`，把 `outputs/eval_phase1/retrieval_ceiling_diag_test.md` 的 "Best Overall" + recall@k 曲线表贴回来。
+**下次 session 第一句话**：AutoDL 上 `git pull` + `python -m src.build_stage0 --force`，贴 v2 SFT 数据的 label 分布。然后 kickoff SFT 训练（cell-2-sft-train 改 DATA_PATH 指向 v2）。

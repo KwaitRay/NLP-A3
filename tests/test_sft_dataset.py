@@ -81,6 +81,36 @@ def main() -> None:
     print("  assistant:", assistant_content)
     print("  _meta:", one["_meta"])
 
+    # --- Phase 4 weak_buckets oversampling ---
+    # c-2 scenario=refutes_clear, c-3 scenario=disputed_conflict, c-3 also
+    # difficulty=hard. With factor 3 on refutes_clear and 2 on hard:
+    #   - c-1 (supports_clear, easy): factor 1 → 1 real + 1 hn = 2
+    #   - c-2 (refutes_clear, medium): factor 3 → 3 real + 3 hn = 6
+    #   - c-3 (disputed_conflict, hard): max(1, 2) = 2 → 2 real + 2 hn = 4
+    # Total: 12. Confirms (a) factor multiplies both real + hard-neg, and
+    # (b) overlapping matches resolve to max not product.
+    out2 = build_dataset(
+        TAGGED, FAKE_EV, k=3, pad_with_random=True, n_hard_neg=1, seed=7,
+        weak_buckets={
+            ("scenario", "refutes_clear"): 3,
+            ("difficulty", "hard"): 2,
+        },
+    )
+    assert len(out2) == 12, f"expected 12 with weak_buckets, got {len(out2)}"
+    c2_normals = [r for r in out2 if r["id"] == "c-2"]
+    c3_normals = [r for r in out2 if r["id"] == "c-3"]
+    assert len(c2_normals) == 3, f"c-2 should appear 3× (factor 3), got {len(c2_normals)}"
+    assert len(c3_normals) == 2, f"c-3 should appear 2× (max factor 2), got {len(c3_normals)}"
+    print(f"  [pass] weak_buckets: 12 records (c-2×3, c-3×2 via max)")
+
+    # No-op when weak_buckets={} or None → identical count to baseline.
+    out3 = build_dataset(
+        TAGGED, FAKE_EV, k=3, pad_with_random=True, n_hard_neg=1, seed=7,
+        weak_buckets={},
+    )
+    assert len(out3) == 6, f"empty weak_buckets should be no-op, got {len(out3)}"
+    print(f"  [pass] empty weak_buckets is no-op (6 records)")
+
 
 if __name__ == "__main__":
     main()

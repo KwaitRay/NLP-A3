@@ -209,7 +209,7 @@ def write_summary(results: list[dict], dataset_label: str) -> Path:
 
 # -- Pipeline init ---------------------------------------------------------
 
-def build_pipeline(evidence: dict, *, final_k: int = 5):
+def build_pipeline(evidence: dict, *, final_k: int = 20):
     from src.retrieval.bm25 import BM25Retriever
     from src.retrieval.dense import DenseRetriever
     from src.retrieval.pipeline import RetrievalPipeline, RetrievalConfig
@@ -296,11 +296,12 @@ def main():
                    help="Local model snapshot. Omit to download from ModelScope.")
     p.add_argument("--limit", type=int, default=None,
                    help="Cap claims for quick smoke (e.g. --limit 30).")
-    p.add_argument("--final-k", type=int, default=5,
+    p.add_argument("--final-k", type=int, default=20,
                    help="Top-k evidences shown to the model in Track 2 RAG. "
-                        "Phase 3.5 audit (`scripts.retrieval_ceiling --mode final_k`) "
-                        "showed recall@5=0.119 but recall@20=0.333; try --final-k 20 "
-                        "to verify end-to-end HM lift.")
+                        "Default 20 (Phase 3.5 lock, see optimization_plan.md "
+                        "§10). Use --final-k 5 to reproduce the pre-Phase-3.5 "
+                        "baseline; outputs get a `_k5` filename suffix to "
+                        "preserve the current production tables.")
     args = p.parse_args()
 
     tracks = [int(x) for x in args.tracks.split(",")]
@@ -310,11 +311,11 @@ def main():
             raise SystemExit(f"unknown prompt version: {v}; available: {list(PROMPT_VARIANTS)}")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    # When --final-k differs from production default (5), suffix output filenames
-    # so we don't clobber the k=5 baseline tables. diagnose_phase1.py strips the
-    # suffix when looking up the gold split.
+    # Phase 3.5 lock: production final_k is 20. When --final-k differs we
+    # suffix output filenames so the production tables aren't clobbered.
+    # diagnose_phase1.py strips the suffix when looking up the gold split.
     dataset_label = (
-        args.dataset if args.final_k == 5 else f"{args.dataset}_k{args.final_k}"
+        args.dataset if args.final_k == 20 else f"{args.dataset}_k{args.final_k}"
     )
     print(f"=== Phase 1 eval: tracks={tracks} prompts={prompts} "
           f"dataset={args.dataset} final_k={args.final_k} ===")

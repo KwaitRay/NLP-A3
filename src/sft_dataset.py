@@ -222,6 +222,33 @@ def curriculum_sort_key(rec: dict) -> tuple[int, int]:
     return (rank, hash(rec.get("id", "")))
 
 
+def _bucket_value(row: dict, axis: str):
+    """Read ``row[axis]`` accounting for the nested ``difficulty.level`` schema."""
+    if axis == "difficulty":
+        d = row.get("difficulty")
+        return d.get("level") if isinstance(d, dict) else d
+    return row.get(axis)
+
+
+def _bucket_factor(row: dict, weak_buckets: dict[tuple[str, str], int] | None) -> int:
+    """Return the max oversample factor for this row across matching keys.
+
+    Default 1 (no duplication). When ``weak_buckets`` is e.g.
+    ``{("scenario", "nei_underspec"): 4, ("difficulty", "hard"): 2}``, a row
+    whose scenario is "nei_underspec" *and* difficulty is "hard" still gets
+    factor 4 — we take the max, not the product, to avoid runaway when a row
+    matches several weak axes.
+    """
+    if not weak_buckets:
+        return 1
+    factor = 1
+    for (axis, bucket), f in weak_buckets.items():
+        if _bucket_value(row, axis) == bucket:
+            if f > factor:
+                factor = f
+    return factor
+
+
 def build_dataset(
     tagged_rows: list[dict],
     evidence_corpus: dict[str, str],
@@ -232,19 +259,31 @@ def build_dataset(
     n_hard_neg: int = 0,
     seed: int = 42,
     apply_curriculum: bool = True,
+    weak_buckets: dict[tuple[str, str], int] | None = None,
 ) -> list[dict]:
-    """Top-level builder. ``tagged_rows`` should be from claims_tagged.jsonl."""
+    """Top-level builder. ``tagged_rows`` should be from claims_tagged.jsonl.
+
+    ``weak_buckets``: Phase 4 weighted oversampling per
+    ``optimization_plan.md §4``. Pass ``{(axis, bucket_name): factor}`` to
+    duplicate each matching row's records (both real and hard-negative) by
+    ``factor``. Multiple matches → max factor, not product. Random padding
+    (`pad_with_random=True`) and hard-neg sampling consume the shared
+    ``rng`` across duplicates, so duplicate copies do see different
+    distractor / random evidence — they aren't bit-identical clones.
+    """
     rng = random.Random(seed)
     out: list[dict] = []
     for row in tagged_rows:
-        rec = build_sft_record(
-            row, evidence_corpus,
-            retrieval=retrieval, k=k,
-            pad_with_random=pad_with_random, rng=rng,
-        )
-        if rec is not None:
-            out.append(rec)
-        for _ in range(n_hard_neg):
+        factor = _bucket_factor(row, weak_buckets)
+        for _ in range(factor):
+            rec = build_sft_record(
+                row, evidence_corpus,
+                retrieval=retrieval, k=k,
+                pad_with_random=pad_with_random, rng=rng,
+            )
+            if rec is not None:
+                out.append(rec)
+        for _ in range(n_hard_neg * factor):
             hn = build_hard_negative_record(
                 row, evidence_corpus, k=k, rng=rng,
             )

@@ -7,8 +7,15 @@ Pipeline:
   1. EDA report   →  outputs/eda/eda_report.md
   2. Tagging      →  outputs/sft_data/claims_tagged.jsonl + tag_distribution.md
   3. Hash splits  →  outputs/splits/{train_split,dev_holdout,diag_test,official_dev}.jsonl
-  4. SFT data     →  outputs/sft_data/sft_{train,dev_holdout,diag_test}_v1.jsonl
+  4. SFT data     →  outputs/sft_data/sft_{train,dev_holdout,diag_test}_v2.jsonl
                      (4 needs evidence.json — gracefully skipped if missing)
+
+v2 (2026-05-12, Phase 4): k=20 to match the locked production RetrievalConfig
+from Phase 3.5; train split also applies ``weak_buckets`` oversampling on the
+buckets that diagnose_phase1 flagged worst at k=20 (nei_underspec n=40 HM=0.039,
+disputed_conflict n=21 HM=0.164, refutes_clear n=17 HM=0.116). See
+``optimization_plan.md §4.3``. v1 files (k=5, no oversampling) stay on disk for
+ablation.
 """
 from __future__ import annotations
 
@@ -71,16 +78,27 @@ def step_sft(force: bool) -> dict[str, Path]:
         print("       Download evidence.json (see data/evidence.md) and re-run.")
         return out
 
+    # Phase 4 weak-bucket oversampling targets — derived from the k=20
+    # diag_test diagnostic (outputs/eval_phase1/diagnose_diag_test_k20.md):
+    # NEI underspec is the dominant error mode (HM=0.039), DISPUTED/REFUTES
+    # secondary. Factors picked so the rebalanced train mix is roughly
+    # uniform across the 4 labels rather than gold-distribution-biased.
+    _TRAIN_WEAK_BUCKETS = {
+        ("scenario", "nei_underspec"): 4,
+        ("scenario", "disputed_conflict"): 2,
+        ("scenario", "refutes_clear"): 2,
+    }
     expected = {
         "train": (SPLITS_DIR / "train_split.jsonl",
-                  SFT_DIR / "sft_train_v1.jsonl",
-                  dict(k=5, pad_with_random=True, n_hard_neg=1, apply_curriculum=True)),
+                  SFT_DIR / "sft_train_v2.jsonl",
+                  dict(k=20, pad_with_random=True, n_hard_neg=1,
+                       apply_curriculum=True, weak_buckets=_TRAIN_WEAK_BUCKETS)),
         "dev_holdout": (SPLITS_DIR / "dev_holdout.jsonl",
-                        SFT_DIR / "sft_dev_holdout_v1.jsonl",
-                        dict(k=5, pad_with_random=True, n_hard_neg=0, apply_curriculum=False)),
+                        SFT_DIR / "sft_dev_holdout_v2.jsonl",
+                        dict(k=20, pad_with_random=True, n_hard_neg=0, apply_curriculum=False)),
         "diag_test": (SPLITS_DIR / "diag_test.jsonl",
-                      SFT_DIR / "sft_diag_test_v1.jsonl",
-                      dict(k=5, pad_with_random=True, n_hard_neg=0, apply_curriculum=False)),
+                      SFT_DIR / "sft_diag_test_v2.jsonl",
+                      dict(k=20, pad_with_random=True, n_hard_neg=0, apply_curriculum=False)),
     }
     if not force and all(_exists_and_nonempty(t) for _, t, _ in expected.values()):
         print("[skip] SFT data files exist")

@@ -1135,6 +1135,28 @@ Phase 2 sweep 顺手发现的**最大教训**：4 个 prompt 在 Track 2 上的 
 
 **复用**：每次 sweep prompt / model 时**同时打印 evidence recall**——`diagnose_phase1.py` 已实现。如果 recall 在 4-5 个变体上都一样，瓶颈不在 sweep 的维度上，停止 sweep 转向被忽略的 retrieval 维度。
 
+### 23. final_k sweep 揭示 base 模型的"信息密度悖论"
+
+Phase 3.5 把 `final_k` 从 5 扫到 20（k ∈ {5, 10, 20}）端到端实测：
+
+| k | non-NEI acc | NEI acc | 总 Acc | HM | predicted NEI 占比 |
+|---|---|---|---|---|---|
+| 5  | 0.457 | **0.350** | 0.422 | 0.183 | 25% |
+| 10 | 0.494 | 0.175 | 0.388 | 0.196 | 12% |
+| 20 | **0.580** | **0.025** | 0.397 | **0.203** | 3% |
+
+**单调权衡**：k 大 → non-NEI 涨（更多 gold ev 进 cite）+ NEI 跌（20 条 ev 里"总有看起来沾边的"，模型不肯说不知道）+ HM 略升。
+
+**关键启示**：base 模型把"evidence 多"误读成"必有答案"。NEI 不是输出格式问题，是**判断"这些 ev 都不相关"的能力问题**。SFT 必须用 NEI oversample + hard-neg 教这个判断（§0.5.3 硬约束 1，现在 quantified）。
+
+**生产决策**：锁 k=20 而不是 k=10 因为：
+1. HM 最高（虽然 0.007 差距是噪声级，但单调趋势真实）
+2. 对 SFT 来说**起点 NEI acc 是 0.025 还是 0.175 无关**（SFT 重写行为，不保留 base 习惯）
+3. k=20 把所有 error 压到 NEI 一类 → SFT 信号最清晰
+4. Phase 4 投影：SFT 把 NEI acc 修到 0.50 时 → k=20 HM ≈ 0.219，k=10 HM ≈ 0.207
+
+`RetrievalConfig.final_k` default 5 → 20；`phase1_eval --final-k` default 同步；
+非 default k 自动加 `_kN` 后缀防覆盖（`diagnose_phase1._strip_k_suffix` 解析）。
 
 
 

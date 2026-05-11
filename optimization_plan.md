@@ -337,30 +337,47 @@ training budget, biggest lift on weakest buckets.
 | **domain** = `general_other` (启发式覆盖率不足 / heuristic miss) | 训练分布外 / out-of-distribution at train time | 重新跑 §1.2 三维打标，用 sentence-transformer 聚类细化 `general_other` 子类（当前 519 / 1228 = 42% 兜底） |
 | **difficulty** = `hard` | 多证据需聚合 / aggregation required | 在 `build_sft_record` 里给 hard 样本设 `k=8`（看更多 evidence） |
 
-### 4.4 实施 / Implementation
+### 4.4 实施 / Implementation (✅ 2026-05-12)
 
-修改 `src/sft_dataset.py:build_dataset` 的 sampler：
+`src/sft_dataset.py:build_dataset` 已加 `weak_buckets` 参数，签名：
 
 ```python
-# 伪代码 / pseudocode
-def build_dataset(tagged_rows, evidence, *, weak_buckets=None, **kwargs):
-    """weak_buckets: dict like {('scenario', 'nei_topic_off'): 3, ...}
-    multiplier per matching record."""
-    out = []
-    for row in tagged_rows:
-        record = build_sft_record(row, evidence, ...)
-        n_copies = _bucket_multiplier(row, weak_buckets)  # default 1
-        for _ in range(n_copies):
-            out.append(record)
-        # hard-neg 同样按 weak_buckets 缩放
+def build_dataset(
+    tagged_rows, evidence_corpus, *,
+    retrieval=None, k=20, pad_with_random=False, n_hard_neg=0,
+    seed=42, apply_curriculum=True,
+    weak_buckets: dict[tuple[str, str], int] | None = None,
+) -> list[dict]:
 ```
 
-**实现工单 / Ticket**: 加 `weak_buckets` 参数到 `build_dataset`，新建 `outputs/sft_data/sft_train_v2.jsonl`，保留 v1 备份用于 ablation。
+匹配多个 (axis, bucket) 的 row 取**最大** factor（非乘积）以避免失控；
+对真实 SFT 记录和 hard-neg 记录同时缩放；`rng` 跨重复样本共享 → 不同
+副本的 random padding / hard-neg 噪声 evidence 不同（非简单克隆）。
+
+`src/build_stage0.step_sft` 内置 Phase 4 配比（基于
+`outputs/eval_phase1/diagnose_diag_test_k20.md` 的 per-bucket 数据）：
+
+```python
+_TRAIN_WEAK_BUCKETS = {
+    ("scenario", "nei_underspec"): 4,       # n=40, HM=0.039 — primary
+    ("scenario", "disputed_conflict"): 2,   # n=21, HM=0.164 — secondary
+    ("scenario", "refutes_clear"): 2,       # n=17, HM=0.116
+}
+```
+
+`tests/test_sft_dataset.py` 覆盖：(1) factor 同时缩放 real + hard-neg，
+(2) 多 (axis, bucket) 匹配取 max 而非 product，(3) `weak_buckets={}`
+或 None 为 no-op。
 
 ### 4.5 产出 / Output
 
-- `outputs/sft_data/sft_train_v2.jsonl`（弱桶倾斜版 / weak-bucket-tilted）
-- `outputs/sft_data/sft_train_v2_meta.json`（记录用了哪些 weak_buckets 配比）
+- `outputs/sft_data/sft_train_v2.jsonl`（k=20 + weak_buckets 倾斜版 /
+  k=20 with weak-bucket tilt）
+- `outputs/sft_data/sft_{dev_holdout,diag_test}_v2.jsonl`（k=20，不做
+  oversample，用于评估 / k=20, no oversample, used for eval）
+- v1 文件保留 / v1 files preserved（k=5 baseline，ablation 用）
+
+跑：`python -m src.build_stage0 --force` 重建（~5 s on AutoDL）。
 
 ---
 
@@ -539,18 +556,21 @@ AutoDL boxes; submission zip carries only small artifacts.
       未能修 v3 的问题。验证 §0.5.3 硬约束 1+3（NEI/DISPUTED 是能力问题，prompt 教不会）。
 - [x] **检索天花板发现（关键）**：Track 2 v1-v4 evidence recall 全部 ≈ 0.11，与 prompt 无关。
       F-score 当前架构硬上限 ≈ 0.12，HM ≈ 0.21。在 SFT 之前必须先做 Phase 3.5。
+- [x] **Phase 3.5 检索审计完成**：`final_k` mode 显示 recall@5=0.119 / recall@20=0.333 /
+      recall@100=0.579，gold ev 多在 rank 6-20。端到端验证 k=5/10/20 在 Track 2 v1 上跑：
+      HM 0.183 / 0.196 / 0.203 单调上升。**锁定 `final_k=20`**（`RetrievalConfig` default 已改）。
+      副作用：NEI acc 0.350 → 0.025（k=20 让模型几乎不输出 NEI，正好是 Phase 4 要修的）。
+- [x] **Phase 4 `weak_buckets` 实现**：`src/sft_dataset.py:build_dataset` 加参数；
+      `src/build_stage0.py` 内置 `{nei_underspec:4, disputed_conflict:2, refutes_clear:2}` 配比；
+      `tests/test_sft_dataset.py` 覆盖。
 
 ### 进行中 / In progress
-- [ ] **Phase 3.5 检索天花板审计 / Retrieval ceiling audit**：跑 `scripts.retrieval_ceiling`
-      四个 mode（final_k / retriever / fusion_w / synonym_expand），找出 recall 瓶颈
-      和最佳 `RetrievalConfig`。
-      *Run `scripts.retrieval_ceiling` across 4 modes; locate recall bottleneck +
-      lock best `RetrievalConfig` before Phase 4 SFT data regen.*
+- [ ] **重建 SFT 数据 / Rebuild SFT data**：AutoDL 上跑 `python -m src.build_stage0 --force`
+      生成 `sft_{train,dev_holdout,diag_test}_v2.jsonl`（~5 s）。
+      *Run on AutoDL to regenerate the v2 SFT corpus.*
 
 ### 待做 / Todo
-- [ ] 用锁定 `RetrievalConfig` 重建 SFT 数据 (`python -m src.build_stage0 --force`)
-- [ ] Phase 4：弱桶定位 + 给 `build_dataset` 加 `weak_buckets` 参数（用 Track 2 v1 per-bucket 表）
-- [ ] Phase 5：SFT v2 训练 + DPO 训练 + 4-track 评估
+- [ ] Phase 5：SFT v2 训练（ms-swift CLI 指 v2 数据）+ DPO 训练 + 4-track 评估
 - [ ] Phase 6：official dev 终评 + test 集预测 + 报告
 
 ---
@@ -566,7 +586,10 @@ AutoDL boxes; submission zip carries only small artifacts.
 | 2026-05-12 | Phase 1 diagnosed | 非 parser fallback。Track 1 NEI acc=0.025 / DISPUTED acc=0.000（base 模型缺这两类能力，量化重复 §0.5.2 4a）。Track 2 v1 per-label: S 0.526 / R 0.500 / NEI 0.350 / D 0.286 — RAG 补了 NEI/DISPUTED 但磨钝 S/R。 | `outputs/eval_phase1/diagnose_diag_test.md` |
 | 2026-05-12 | Phase 2 done | 锁定 prompt **v1 baseline**（HM=0.1830）。v2 NEI 指令 over-correct 偷 REFUTES (−27pp)；v3 DISPUTED 把 REFUTES 干到 0；v4 few-shot 未修。验证 §0.5.3 硬约束 1+3。 | `outputs/eval_phase1/summary_diag_test.md` |
 | 2026-05-12 | 检索天花板发现 / Retrieval ceiling found | Track 2 v1-v4 evidence recall 全部 ≈ 0.11（与 prompt 无关）→ F-score 当前架构硬上限 ≈ 0.12, HM ≈ 0.21。SFT 之前必须先做 Phase 3.5。 | `outputs/eval_phase1/diagnose_diag_test.md` |
-| TBD | Phase 3.5 done | 锁定 `RetrievalConfig`: final_k=?, w_bm25=?, query rewrite=? Recall@k 提升 +? | `outputs/eval_phase1/retrieval_ceiling_diag_test.md` |
+| 2026-05-12 | Phase 3.5 audit (final_k mode) | macro recall@k: 5→0.119 / 10→0.210 / 20→0.333 / 50→0.485 / 100→0.579. Gold ev 集中在 rank 6-20。 | `outputs/eval_phase1/retrieval_ceiling_diag_test.md` |
+| 2026-05-12 | Phase 3.5 done — final_k=20 锁定 | k=5/10/20 端到端实测：HM 0.183 / 0.196 / 0.203（单调）。k=20 NEI acc 0.025（崩塌），SUPPORTS 0.737 / REFUTES 0.682（暴涨）。`RetrievalConfig.final_k` 默认改为 20；`phase1_eval --final-k` 默认 20，非默认值加 `_kN` 后缀防覆盖。 | `outputs/eval_phase1/diagnose_diag_test_k20.md` |
+| 2026-05-12 | Phase 4 implementation | `build_dataset` 加 `weak_buckets` 参数；`build_stage0` 内置 `{nei_underspec:4, disputed_conflict:2, refutes_clear:2}`；tests 全绿。SFT 数据待重建。 | `src/sft_dataset.py`, `src/build_stage0.py`, `tests/test_sft_dataset.py` |
+| TBD | SFT data v2 built | `sft_train_v2.jsonl` 记录数 = ? (~3500 预估)；NEI 类样本占比从 ~25% → ~? | `outputs/sft_data/sft_train_v2.jsonl` |
 | TBD | Phase 2 done | 锁定 prompt: v?  Track 2 HM 提升 +? | `outputs/eval_phase1/summary_diag_test.md` |
 | TBD | Phase 4 done | weak_buckets 配比: {...} → sft_train_v2.jsonl | `outputs/sft_data/sft_train_v2_meta.json` |
 | TBD | Phase 5 done | SFT/DPO HM = ?, 最弱桶提升: ... | Phase 5 eval reports |

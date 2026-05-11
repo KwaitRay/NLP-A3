@@ -2,6 +2,55 @@
 
 > Live status tracker. Update when crossing milestones. Plan in `~/.claude/plans/fancy-mapping-lemur.md`.
 
+## 2026-05-12 — Session 10 (Phase 3.5 final_k locked + Phase 4 weak_buckets implemented)
+
+End-to-end retrieval audit + Phase 4 implementation. Repo state moves
+from "knows retrieval is the bottleneck" to "production config locked,
+SFT data design done, ready to train".
+
+- **Phase 3.5 audit (final_k mode)** on AutoDL via
+  `scripts.retrieval_ceiling --mode final_k`: macro recall@k curve
+  k=5→0.119, k=10→0.210, k=20→0.333, k=50→0.485, k=100→0.579.
+  Gold evidence sits at ranks 6-20 — current production k=5 was
+  throwing it away.
+- **End-to-end k=5/10/20 sweep on Track 2 v1**:
+  - k=5  (current): F 0.117  Acc 0.422  HM 0.183  (baseline)
+  - k=10:           F 0.131  Acc 0.388  HM 0.196
+  - k=20:           F 0.136  Acc 0.397  **HM 0.203**  (winner)
+  - Surprise: at k=20 the model almost never predicts NEI (0.025
+    acc, 3 predicted out of 121). non-NEI acc shoots up to 0.580
+    (vs k=5's 0.457). Trade-off net positive for HM but pushes
+    100% of error onto the NEI bucket — exactly what Phase 4
+    weak_buckets is designed to fix.
+- **Phase 3.5 lock: `final_k=20`**.
+  - `RetrievalConfig.final_k` default 5 → 20 with inline comment.
+  - `phase1_eval --final-k` default also 20; non-default k auto-suffixes
+    output filenames as `_kN` to preserve baseline tables.
+  - `diagnose_phase1._strip_k_suffix` strips the suffix when looking up
+    the underlying gold split.
+- **Phase 4 weak_buckets implemented**.
+  - `src/sft_dataset.py:build_dataset` adds
+    `weak_buckets: dict[tuple[str, str], int] | None` parameter; per row,
+    the max factor across matching (axis, bucket) keys is applied to
+    both the real record and any hard-negative augmentations.
+    `tests/test_sft_dataset.py` covers (a) factor scaling, (b) max-not-
+    product semantics on overlapping matches, (c) empty/None no-op.
+  - `src/build_stage0.step_sft` switched to k=20 across all three splits
+    and bakes the Phase 4 config:
+    `{nei_underspec:4, disputed_conflict:2, refutes_clear:2}`. Output
+    files versioned `sft_*_v2.jsonl`; v1 kept on disk for ablation.
+- **debug_log 复用经验 23**: the "information-density paradox" —
+  larger k makes the base model assume an answer exists in the evidence
+  set, so it stops predicting NEI. Quantified across 3 k values. Locks
+  the rationale for k=20 + Phase 4 NEI oversample as a coupled pair.
+- **optimization_plan §3.5 / §4.4 finalised**: §3.5 now records the
+  audit result + Phase 3.5 lock; §4.4 replaces pseudocode with the
+  actual implementation reference (signature + Phase 4 dict).
+- **What's next**: AutoDL runs `python -m src.build_stage0 --force` to
+  produce the v2 SFT files (~5s), then kicks off ms-swift LoRA training
+  with `DATA_PATH=outputs/sft_data/sft_train_v2.jsonl`
+  (~25-35 min on 4080 SUPER).
+
 ## 2026-05-12 — Session 9 (Phase 1 diagnosed + Phase 2 prompt sweep + retrieval ceiling discovered)
 
 Three major findings in one session; the third reshapes the rest of the plan.

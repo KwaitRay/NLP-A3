@@ -27,7 +27,13 @@ class RetrievalConfig:
     rerank_top: int = 50
     use_rule_reorder: bool = True
     rule_top: int = 20
-    final_k: int = 5
+    # Phase 3.5 lock (2026-05-12): final_k=20 chosen over 5 because the audit
+    # (`scripts.retrieval_ceiling --mode final_k`) showed macro recall@20=0.333
+    # vs recall@5=0.119 — gold evidence sits at ranks 6-20 for most claims.
+    # End-to-end Track 2 v1 HM lifted from 0.183→0.203. See
+    # optimization_plan.md §10 decision log + outputs/eval_phase1/
+    # retrieval_ceiling_diag_test.md for the curve.
+    final_k: int = 20
     label_conditioned_k: bool = True
     # NEI-class evidence count is always 5; non-NEI median 2-3.
     nei_k: int = 5
