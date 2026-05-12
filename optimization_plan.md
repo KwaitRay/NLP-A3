@@ -338,7 +338,7 @@ training budget, biggest lift on weakest buckets.
 | **domain** = `general_other` (启发式覆盖率不足 / heuristic miss) | 训练分布外 / out-of-distribution at train time | 重新跑 §1.2 三维打标，用 sentence-transformer 聚类细化 `general_other` 子类（当前 519 / 1228 = 42% 兜底） |
 | **difficulty** = `hard` | 多证据需聚合 / aggregation required | 在 `build_sft_record` 里给 hard 样本设 `k=8`（看更多 evidence） |
 
-### 4.4 实施 / Implementation (✅ 2026-05-12)
+### 4.4 实施 / Implementation (v2 ✅ 2026-05-12，revised PM 同日)
 
 `src/sft_dataset.py:build_dataset` 已加 `weak_buckets` 参数，签名：
 
@@ -355,16 +355,34 @@ def build_dataset(
 对真实 SFT 记录和 hard-neg 记录同时缩放；`rng` 跨重复样本共享 → 不同
 副本的 random padding / hard-neg 噪声 evidence 不同（非简单克隆）。
 
-`src/build_stage0.step_sft` 内置 Phase 4 配比（基于
-`outputs/eval_phase1/diagnose_diag_test_k20.md` 的 per-bucket 数据）：
+`src/build_stage0.step_sft` 内置 Phase 4 配比（**v2 revision，2026-05-12 PM**，
+根因 debug_log 复用经验 32）：
 
 ```python
+# v2 first cut (broken): n_hard_neg=1, nei_underspec ×4 → 79.1% NEI in train
+# → SFT collapsed to "always predict NEI" (Track 3 HM 0.140 < Track 2 0.201)
 _TRAIN_WEAK_BUCKETS = {
-    ("scenario", "nei_underspec"): 4,       # n=40, HM=0.039 — primary
-    ("scenario", "disputed_conflict"): 2,   # n=21, HM=0.164 — secondary
-    ("scenario", "refutes_clear"): 2,       # n=17, HM=0.116
+    ("scenario", "nei_underspec"): 2,       # 4 → 2 (real NEI 减半)
+    ("scenario", "disputed_conflict"): 3,   # 2 → 3 (DISPUTED 仍弱，加强)
+    ("scenario", "refutes_clear"): 2,       # 不变
 }
+# train config 也改：n_hard_neg=0（去掉 hard-neg 同义重复 → 2083 条 synth NEI）
 ```
+
+实测重建后 label 分布（vs gold 33% NEI / 31% S / 18% R / 17% D）：
+
+| label | v2-broken | **v2-rebalanced** | gold | ratio |
+|---|---|---|---|---|
+| SUPPORTS | 10.4% | 27.6% | 31.4% | 0.88 |
+| REFUTES | 6.2% | 16.5% | 18.2% | 0.91 |
+| **NEI** | **79.1%** ⚠️ | **38.7%** | 33.1% | 1.17 |
+| DISPUTED | 4.3% | 17.2% | 17.4% | 0.99 |
+
+总记录 4166 → 1567 (×2.7 缩小)，训练时间预估 4h → ~1.5h。
+
+**Sanity check 落在 `src/build_stage0.py:_print_label_dist`**：每个 split build
+完打印 vs gold label distribution + ratio，**ratio > 2× 或 < 0.5× warn**，
+指向 debug_log 复用经验 32。再也不会盲跑 4h 然后发现 class-collapse。
 
 `tests/test_sft_dataset.py` 覆盖：(1) factor 同时缩放 real + hard-neg，
 (2) 多 (axis, bucket) 匹配取 max 而非 product，(3) `weak_buckets={}`
@@ -622,7 +640,9 @@ AutoDL boxes; submission zip carries only small artifacts.
 | 2026-05-12 | Env stack locked | torch 2.5.1+cu124 + ms-swift 4.2.0 + transformers 5.2.0 + peft (latest, post-HybridCache-removal) + qwen_vl_utils 0.0.14+ + liger-kernel + bitsandbytes 0.49+。FSDP2 patch (`scripts/patch_swift_fsdp2.py`) 把 ms-swift 4.2 对 torch 2.6 API 的硬依赖打成可选。`requirements.txt` 拆 torch 2.5（默认）+ `requirements-torch26.txt`（未来）。`nbstripout` 加入 dev deps 防 jupyter autosave 与 git pull 死锁（debug_log 复用经验 27/28/29）。 | `requirements.txt`, `requirements-torch26.txt`, `scripts/patch_swift_fsdp2.py`, `debug_log.md` 复用经验 27-29 |
 | 2026-05-12 | SFT v2 kickoff | 训练参数：LoRA r=16 / α=32，QLoRA 4-bit + bf16，BS=2 ×GA=8 (eff 16)，lr 2e-4 + warmup 0.03，max_len 1536，liger_kernel + group_by_length + save_total_limit=3，thinking 三件套 (--enable_thinking false / --add_non_thinking_prefix true / --loss_scale ignore_empty_think)，3 epochs / 783 steps。Step 1 loss 0.1146 / step 25 loss 0.019 / VRAM 11.4 GB / ~19 s/step (4080 SUPER) / 预估 ~4h 总。Loss 低是 prompt-masking 正常表现（debug_log 复用经验 30），真信号看 Track 3 vs 2 metric delta。 | SFT stdout log，checkpoint 路径 `nlp_a3_cache/sft-out/v4-20260512-040505/` |
 | 2026-05-12 | phase1_eval Track 3 wired | 新增 `--sft-adapter PATH` flag → `PeftModel.from_pretrained(base, path)` 原地包装。`--tracks 3` 强制 require adapter。Track 3 = base + SFT + RAG (k=20)，复用 ZeroShotInferer。诊断脚本 / write_summary 自动支持 track3_* 文件 prefix。 | `scripts/phase1_eval.py` |
-| TBD | SFT v2 training done | Δ HM vs Track 2 v1 (0.203); NEI acc 0.025 → ?；non-NEI acc 0.580 → ? | `outputs/sft-out/checkpoint-final` + diagnose_phase1 post-SFT 报告 |
+| 2026-05-12 PM | SFT v2 first cut **失败** (class-collapse) | merged-LoRA Track 3 数字 HM 0.140 < Track 2 baseline 0.201（−6pp）。诊断揭示：predicted NEI 占比 **92.6%**（gold 33%），NEI acc 0.975 但 non-NEI acc **0.062** —— 训练数据 79.1% NEI 让模型塌缩到 majority class。根因：`n_hard_neg=1` × `nei_underspec ×4` 双重 NEI 放大。详见 debug_log 复用经验 32。 | `outputs/eval_phase1/diagnose_diag_test.md` (track3_v1 行) |
+| 2026-05-12 PM | v2 revision (rebalanced) | `n_hard_neg: 1→0` + `nei_underspec: 4→2` + `disputed: 2→3`。重建后 NEI label 占比 79.1% → 38.7%（接近 gold 33%），总记录 4166→1567 (×2.7 缩小)。所有 ratio 在 0.63-1.89× gold 区间。`build_stage0` 加 distribution sanity check 每个 split 打印 + warn >2×/<0.5× 偏差。 | `src/build_stage0.py` + label-dist 输出 |
+| TBD | SFT v3 training done | 重训 + 重 Track 3 评估。Δ HM vs Track 2 v1 (0.201); NEI acc / non-NEI acc 期望落在 [0.40, 0.60] 区间（既不塌缩也不无效）。 | `outputs/sft-out/v5-*/checkpoint-final` + diagnose 报告 |
 | TBD | Phase 2 done | 锁定 prompt: v?  Track 2 HM 提升 +? | `outputs/eval_phase1/summary_diag_test.md` |
 | TBD | Phase 4 done | weak_buckets 配比: {...} → sft_train_v2.jsonl | `outputs/sft_data/sft_train_v2_meta.json` |
 | TBD | Phase 5 done | SFT/DPO HM = ?, 最弱桶提升: ... | Phase 5 eval reports |

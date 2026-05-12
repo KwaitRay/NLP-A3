@@ -16,6 +16,22 @@ buckets that diagnose_phase1 flagged worst at k=20 (nei_underspec n=40 HM=0.039,
 disputed_conflict n=21 HM=0.164, refutes_clear n=17 HM=0.116). See
 ``optimization_plan.md §4.3``. v1 files (k=5, no oversampling) stay on disk for
 ablation.
+
+v2 revision (2026-05-12 PM, debug_log 复用经验 32): the first v2 cut had
+nei_underspec ×4 + n_hard_neg=1 → 79.1% of training labels were NEI and the
+SFT model collapsed to "always predict NEI" (Track 3 NEI acc 0.97, non-NEI acc
+0.06, total HM 0.140 < Track 2 baseline 0.201). Rebalanced to:
+
+  - nei_underspec ×4 → ×2 (real NEI samples halved)
+  - disputed_conflict ×2 → ×3 (DISPUTED still weak, push harder)
+  - refutes_clear ×2 (unchanged)
+  - n_hard_neg=1 → 0 (drops 2083 synthetic NEI samples that were the dominant
+    source of class imbalance; the 606 real nei_underspec ×2 samples still
+    provide the "off-topic ev → NEI" signal hard constraint 1 requires)
+
+Target NEI share: ~40% (vs gold 33%, vs broken v2 first cut 79%). v1 (k=5)
+remains on disk for ablation; v2 first cut overwritten in place — diagnose log
+preserves the broken numbers as evidence.
 """
 from __future__ import annotations
 
@@ -81,17 +97,21 @@ def step_sft(force: bool) -> dict[str, Path]:
     # Phase 4 weak-bucket oversampling targets — derived from the k=20
     # diag_test diagnostic (outputs/eval_phase1/diagnose_diag_test_k20.md):
     # NEI underspec is the dominant error mode (HM=0.039), DISPUTED/REFUTES
-    # secondary. Factors picked so the rebalanced train mix is roughly
-    # uniform across the 4 labels rather than gold-distribution-biased.
+    # secondary. v2 revision (2026-05-12 PM, debug_log 复用经验 32) cut the
+    # NEI oversample factor and disabled hard-neg synthesis after the first
+    # cut produced 79% NEI labels → SFT collapsed to NEI-default.
     _TRAIN_WEAK_BUCKETS = {
-        ("scenario", "nei_underspec"): 4,
-        ("scenario", "disputed_conflict"): 2,
-        ("scenario", "refutes_clear"): 2,
+        ("scenario", "nei_underspec"): 2,       # was 4 — halve real NEI oversample
+        ("scenario", "disputed_conflict"): 3,   # was 2 — push DISPUTED harder
+        ("scenario", "refutes_clear"): 2,       # unchanged
     }
     expected = {
+        # n_hard_neg=0 below is intentional (was 1): hard-neg synth was the
+        # dominant NEI source in the broken first cut. Real nei_underspec ×2
+        # still provides ~600 "off-topic ev → NEI" examples for hard constraint 1.
         "train": (SPLITS_DIR / "train_split.jsonl",
                   SFT_DIR / "sft_train_v2.jsonl",
-                  dict(k=20, pad_with_random=True, n_hard_neg=1,
+                  dict(k=20, pad_with_random=True, n_hard_neg=0,
                        apply_curriculum=True, weak_buckets=_TRAIN_WEAK_BUCKETS)),
         "dev_holdout": (SPLITS_DIR / "dev_holdout.jsonl",
                         SFT_DIR / "sft_dev_holdout_v2.jsonl",
@@ -119,8 +139,58 @@ def step_sft(force: bool) -> dict[str, Path]:
         sft = build_dataset(rows, ev, seed=42, **kwargs)
         write_jsonl(sft, out_p)
         print(f"[ok ] sft {split_name:12s} → {out_p}  ({len(sft)} records, {time.time() - t0:.1f}s)")
+        _print_label_dist(sft, rows, split_name)
         out[split_name] = out_p
     return out
+
+
+# -- Sanity check ----------------------------------------------------------
+
+def _print_label_dist(sft_records: list[dict], gold_rows: list[dict], split_name: str) -> None:
+    """Print SFT vs gold label distribution; warn on > 2× deviation.
+
+    Class-imbalance is the #1 killer of SFT (debug_log 复用经验 32:
+    79% NEI in v2-first-cut collapsed Track 3 to "always predict NEI",
+    NEI acc 0.97 / non-NEI acc 0.06 / HM 0.140 < Track 2 baseline 0.201).
+    This sanity check runs at build time so we catch the imbalance before
+    a 4h SFT run wastes itself.
+    """
+    from collections import Counter
+    sft_labels: Counter[str] = Counter()
+    for rec in sft_records:
+        msgs = rec.get("messages") or []
+        if not msgs or msgs[-1].get("role") != "assistant":
+            continue
+        content = msgs[-1].get("content", "")
+        first_tok = content.split()[0] if content.split() else "?"
+        sft_labels[first_tok] += 1
+    if not sft_labels:
+        return
+    gold_labels: Counter[str] = Counter(r.get("claim_label", "?") for r in gold_rows)
+    n_sft = sum(sft_labels.values())
+    n_gold = sum(gold_labels.values()) or 1
+
+    LABELS_ORDER = ("SUPPORTS", "REFUTES", "NOT_ENOUGH_INFO", "DISPUTED")
+    print(f"       label distribution ({split_name}, vs gold split):")
+    print(f"       {'label':<18s} {'sft':>10s} {'gold':>10s}  {'sft/gold ratio':>15s}")
+    warnings: list[str] = []
+    for lab in LABELS_ORDER:
+        n_s = sft_labels.get(lab, 0)
+        n_g = gold_labels.get(lab, 0)
+        p_s = n_s / n_sft
+        p_g = (n_g / n_gold) if n_gold else 0.0
+        ratio = (p_s / p_g) if p_g > 0 else float("inf") if p_s > 0 else 1.0
+        flag = ""
+        if p_g > 0 and (ratio > 2.0 or ratio < 0.5):
+            flag = " ⚠"
+            warnings.append(f"{lab}: {ratio:.2f}× gold")
+        print(f"       {lab:<18s} {n_s:>4d} ({p_s:>5.1%}) "
+              f"{n_g:>4d} ({p_g:>5.1%})  {ratio:>10.2f}×{flag}")
+    if warnings and split_name == "train":
+        print(f"       ⚠ class-imbalance warning ({', '.join(warnings)}): "
+              f"see debug_log 复用经验 32.")
+        print(f"         Consider reducing weak_buckets factors or n_hard_neg "
+              f"if SFT collapses to majority class.")
 
 
 def main() -> None:

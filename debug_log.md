@@ -1466,5 +1466,67 @@ python -m scripts.phase1_eval --tracks 2,3 --prompts v1 --dataset diag_test \
    - 跑两段输出 diff：Track 2 和 Track 3 字节级相同 → 适配器没生效
 4. **`AutoModelForImageTextToText` 改 model class 会改 generation 路径** —— Track 2 baseline 也会跟着变（实测 −7pp HM）。不要为了 adapter 兼容性牺牲 baseline。
 
+### 32. SFT 数据 class-imbalance collapse — 训练前必看 label distribution
+
+**症状**（2026-05-12 Track 3 首次评估）：
+
+| | Track 2 v1 (base+RAG) | **Track 3 v1 (SFT+RAG)** | SFT 效果 |
+|---|---|---|---|
+| predicted NEI 占比 | 24.8% (≈ gold 33%) | **92.6%** | over-correct ×3.7 |
+| NEI acc | 0.350 | **0.975** | +63pp（学得太好）|
+| non-NEI acc | 0.580 | **0.062** | **−52pp**（完全崩盘）|
+| HM | 0.201 | **0.140** | **−6pp** |
+
+SFT 训完后 Track 3 比 Track 2 baseline 还低 0.06 HM。模型本质学到了"看到任何 evidence 都先猜 NEI"。
+
+**根因 — 训练 label 分布塌缩到主导类**：
+
+v2 训练数据 4166 条里的 NEI 来源：
+
+| 来源 | 数量 | 占比 |
+|---|---|---|
+| `nei_underspec` real × **4 (weak_buckets)** | 1212 | 29% |
+| 所有类的 `hard_neg = 1` (synth NEI 标) × scale factor | 2083 | **50%** |
+| 其他真实 NEI ev | 0 | 0% |
+| **合计 NEI** | **3295** | **79.1%** ← 远超 gold 33% |
+
+`n_hard_neg=1` 是隐形罪魁：每个 real 样本配一个 hard-neg（labeled NEI），weak_buckets 又给 nei_underspec ×4，nei_underspec 的 hard-neg 也 ×4 → 双重放大 NEI。
+
+模型在 SGD 下，对 majority class 的 likelihood 最大化策略就是"全猜 majority class"。Track 3 NEI 97.5% acc 是"训练正确"，但本质是 dataset bias 的胜利，不是任务能力。
+
+**修复 — 重平衡（v2 revision，2026-05-12 PM）**：
+
+```python
+# src/build_stage0.py _TRAIN_WEAK_BUCKETS
+_TRAIN_WEAK_BUCKETS = {
+    ("scenario", "nei_underspec"): 2,       # 4 → 2 (real NEI 减半)
+    ("scenario", "disputed_conflict"): 3,   # 2 → 3 (DISPUTED 仍弱，加强)
+    ("scenario", "refutes_clear"): 2,       # 不变
+}
+# train config 也改：
+n_hard_neg = 0   # 关键：去掉 hard-neg 同义重复
+```
+
+实测重建后分布：
+
+| label | v2-old | **v2-new** | gold |
+|---|---|---|---|
+| SUPPORTS | 10.4% | 27.6% | 31.4% |
+| REFUTES | 6.2% | 16.5% | 18.2% |
+| NEI | **79.1%** | **38.7%** | 33.1% |
+| DISPUTED | 4.3% | 17.2% | 17.4% |
+
+NEI 从 79.1% → 38.7%（接近 gold 33% + 适度 oversample）。总记录 4166 → 1567 (× 2.7 缩小)，训练时间 4h → ~1.5h。
+
+**Sanity check 写进 `src/build_stage0.py`**：每个 split build 完打印 SFT vs gold label distribution + ratio，**ratio > 2× 或 < 0.5× warn**。这次重建：所有 ratio 在 [0.63, 1.89] 区间，安全。
+
+**复用要点**：
+
+1. **SFT data class balance 是 #1 杀手**。majority class 占 > 60% 几乎必塌。Build time 就要做 distribution check，别等 SFT 训完 4h 才发现 Track 3 比 Track 2 还差。
+2. **`n_hard_neg=1` 在已有强 oversample 的情况下会"双倍放大" majority class**。两个机制叠加要看总和。
+3. **诊断 class-collapse 的 1-line 指标**：`predicted NEI share` 远 > `gold NEI share` 且 `non-NEI acc < 0.10` → 模型在赌 majority。
+4. **重建数据后 sanity check 是必须**：让 `build_stage0` 输出"vs gold split"的对比表，每个 label 的 ratio 一眼看见。
+5. **Hard constraint 1（NEI oversample）的最低剂量**：nei_underspec ×2（real）+ disputed ×3 提供足够的"识别 off-topic ev"信号，不需要 hard_neg synth。
+
 
 

@@ -2,6 +2,50 @@
 
 > Live status tracker. Update when crossing milestones. Plan in `~/.claude/plans/fancy-mapping-lemur.md`.
 
+## 2026-05-12 PM — Session 13 (SFT v2 first cut class-collapse + rebalance)
+
+SFT training finished overnight; Track 3 evaluation revealed catastrophic
+class-collapse — model learned to predict NEI for 92.6% of claims, killing
+non-NEI acc to 0.062. Took the rest of the day to diagnose, fix, and add
+a sanity check so this can't happen again silently.
+
+- **Track 3 eval failure**: merged SFT model via `swift export --merge_lora
+  true` (after AutoModelForImageTextToText loader breakdown, debug_log 复用
+  经验 31). Track 3 HM 0.140 vs Track 2 baseline 0.201 — SFT made things
+  worse by 6pp. diagnose_phase1 cross-run summary table showed the smoking
+  gun: Track 3 predicted NEI share 92.6% (vs gold 33%), non-NEI acc 0.062.
+  Model achieved 97.5% NEI acc but at the cost of 81 non-NEI claims now
+  classified as NEI.
+- **Root cause** (debug_log 复用经验 32): training labels 79.1% NEI from
+  two interacting sources:
+  - `nei_underspec ×4` (weak_buckets) → 1212 real NEI samples (29% of v2)
+  - `n_hard_neg=1` (every claim gets one synthetic NEI hard-neg, also
+    scaled by weak_buckets factors) → **2083 synth NEI samples (50% of v2)**
+  - Total: 3295 / 4166 = 79.1% NEI. With SGD on a heavily imbalanced
+    dataset, the loss-minimizing strategy IS "always predict majority class".
+- **v2 rebalance**:
+  - `nei_underspec ×4 → ×2` (real NEI halved)
+  - `disputed_conflict ×2 → ×3` (DISPUTED still weak, push harder)
+  - `n_hard_neg = 1 → 0` (drops the 2083-sample dominant NEI source)
+  - Result: 1567 records (vs 4166), NEI label share 79.1% → **38.7%**
+    (close to gold 33%, with light +5pp oversample). Training will take
+    ~1.5h instead of 4h (×2.7 fewer records, same eff_bs).
+- **Sanity check landed in `build_stage0.py`**: `_print_label_dist()` prints
+  SFT label distribution vs gold for every split it builds. Warns when any
+  label's `sft_share / gold_share` ratio is > 2× or < 0.5×. The first cut
+  would have fired at NEI 2.39× — we'd have caught it before a 4h SFT run
+  wasted itself.
+- **What's next**: AutoDL `git pull` → `python -m src.build_stage0 --force`
+  → verify the distribution table shows NEI ~1.17× gold → retrain SFT
+  (~1.5h) → merge_lora → retry Track 3 evaluation. Target: NEI acc in
+  [0.40, 0.60] (lifted from base 0.025, not collapsed to 0.97); non-NEI
+  acc ≥ 0.45 (preserved from base 0.58, not catastrophic 0.06); HM ≥ 0.25
+  (vs Track 2 baseline 0.201).
+- **Lesson for future SFT iterations**: any time `n_hard_neg > 0` is on
+  AND `weak_buckets` has a label-coherent boost (e.g. NEI-scenario
+  oversample), check the additive effect on global label share. The two
+  mechanisms compound, and 50%+ majority share will collapse the model.
+
 ## 2026-05-12 — Session 12 (SFT training kickoff — env-stack 三连碰 + Track 3 wiring)
 
 From "v2 data built, ready to train" to "training actually started" took

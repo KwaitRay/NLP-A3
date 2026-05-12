@@ -3,7 +3,7 @@
 > 单页"明天打开就知道做什么"的快速恢复文档。
 > 完整计划见 `optimization_plan.md`，本文只列**接下来一步要做什么**。
 >
-> 最后更新: 2026-05-12 早晨（SFT v2 训练已启动，~4h 跑完。Track 3 评估 wire 完成）
+> 最后更新: 2026-05-12 下午（SFT v2 第一次跑 class-collapse 失败，重平衡 v2 数据待重训）
 
 ---
 
@@ -104,11 +104,52 @@ refutes_clear ×2)。AutoDL 上需要重跑 `python -m src.build_stage0 --force`
 确保 train/inference 一致（`outputs/sft_data/*.jsonl` 在 .gitignore 里 → git
 不传，AutoDL 必须本地重建或 `scp` 传过去）。
 
-### ✅ Step 6 — SFT v2 训练已启动（2026-05-12 ~04:05 UTC）
+### ✅ Step 6 — SFT v2 第一次训练完成（v4-20260512-040505）
 
-训练在 `nlp_a3_cache/sft-out/v4-20260512-040505/` 跑，~4h，等 checkpoint-final 落盘。
+训练 4h 完成，merged via `swift export --merge_lora true`。Track 3 评估**失败**：
+HM 0.140 < Track 2 baseline 0.201，predicted NEI 92.6% / non-NEI acc 0.06。
+**Class-collapse**：训练数据 79% NEI（n_hard_neg=1 + nei_underspec ×4 双重放大）
+让模型学到"看到啥都猜 NEI"。详见 debug_log 复用经验 32 + diagnose_diag_test.md track3_v1 行。
 
-### 🎯 Step 7 — Track 3 评估（**等 SFT 训完立刻做**）
+### ✅ Step 6.5 — SFT 数据重平衡（已完成）
+
+`src/build_stage0.py` 改：
+- `nei_underspec ×4 → ×2`
+- `disputed_conflict ×2 → ×3`
+- `n_hard_neg=1 → 0`（关键：去掉 hard-neg 同义重复）
+
+加 `_print_label_dist()` sanity check：每个 split build 完打印 SFT vs gold
+ratio + warn >2×/<0.5×（如果再撞 class-collapse 不再盲跑 4h）。
+
+本地重建 v2 已验证：1567 records，NEI 占比 79.1% → 38.7%（gold 33.1%）。
+
+### 🎯 Step 7 — AutoDL 重训 SFT v3（**当前最优先**）
+
+```bash
+source /etc/network_turbo
+cd ~/autodl-tmp/NLP-A3
+git pull origin main
+
+# 重 build 重平衡后的 v2 数据（覆盖之前的 broken v2）
+python -m src.build_stage0 --force
+# 应该看到 SFT data distribution 表，NEI ratio 1.17× gold (vs 旧 2.4×)
+
+# 重训 SFT。可以：
+# A. 在 notebook 里重跑 sec2-5-train（DATA_PATH 还是 sft_train_v2.jsonl，
+#    会用新重平衡的数据）
+# B. 终端直接跑 swift sft（确认 args 一致）
+
+# 训完（~1.5h，数据小 2.7×）merge:
+swift export --adapters /root/autodl-tmp/nlp_a3_cache/sft-out/<v5-*>/checkpoint-final \
+    --merge_lora true --output_dir /root/autodl-tmp/nlp_a3_cache/sft-out/merged_v3
+```
+
+预期 Track 3：
+- NEI acc 0.40-0.60（不再 0.97 极端）
+- non-NEI acc ≥ 0.45（不再 0.06 崩盘）
+- HM ≥ 0.25
+
+### 🎯 Step 8 — Track 3 评估（v3 SFT 训完后）
 
 ```bash
 # AutoDL 上
@@ -253,4 +294,4 @@ python -m scripts.build_indexes
 
 ---
 
-**下次 session 第一句话**：AutoDL 上 SFT 训完了，跑 `python -m scripts.phase1_eval --tracks 2,3 --prompts v1 --dataset diag_test --sft-adapter /root/autodl-tmp/nlp_a3_cache/sft-out/checkpoint-final` 再 `python -m scripts.diagnose_phase1 --dataset diag_test`。把 cross-run summary 表 + Track 3 confusion matrix 贴回来 —— 关键看 NEI acc 是否 ≥ 0.40，HM 是否 ≥ 0.28。
+**下次 session 第一句话**：AutoDL 上 `git pull` + `python -m src.build_stage0 --force`（确认 NEI ratio ≈ 1.17×），然后重训 SFT（~1.5h with rebalanced 1567 records），`swift export --merge_lora true`，重跑 `phase1_eval --tracks 2,3 --sft-merged-dir <v3-merged>`。看 Track 3 predicted NEI 占比是否落到 30-50% 区间 + HM 是否 ≥ 0.25。
