@@ -585,6 +585,55 @@ AutoDL boxes; submission zip carries only small artifacts.
 | 部分弱桶 n < 5（统计噪声）/ small-n buckets are noisy | 高 / high | 弱桶判定加 `n >= 5` 门槛（§4.2 已规定） |
 | ModelScope 镜像缺 safetensors → transformers CVE-2025-32434 拒绝 .bin / mirror gap blocks .bin load on torch<2.6 | 已发生 / observed | `python -m scripts.convert_bin_to_safetensors` 本地离线转换；**不**升级 torch（会破坏 flash-attn 2.x 编译）；见 debug_log 问题 16 + design.md D-016 |
 | AutoDL 墙内 HF 直连不通（`[Errno 99]`） / HF unreachable from AutoDL | 已发生 / observed | `export HF_ENDPOINT=https://hf-mirror.com` 走镜像；优先 ModelScope，HF 仅作 fallback |
+| Colab Free 12.7 GB RAM 跑 inference 余量薄 (~1.2 GB) / Colab Free RAM headroom thin for inference | 已审计 / audited | **当前 AutoDL 主线无影响**（31.5 GB 充裕）；若回 Colab Free，启 `faiss.IO_FLAG_MMAP` 改 mmap 加载（−3 GB RAM）和/或换 `bge-small-en-v1.5`（−3 GB 额外，recall 掉 5-10pp）。详见 §8.1 推理 RAM 优化清单。 |
+| Colab 90 min 空闲断连 + 4h SFT 训练 / Colab idle-disconnect 90 min vs 4h SFT | 已审计 | 主线在 AutoDL 训，Colab 备份场景需保活脚本 / Colab Pro |
+
+### 8.1 推理 RAM 优化清单（deferred）/ Inference RAM optimization backlog
+
+**触发条件 / When**：仅当主线从 AutoDL 切回 Colab Free（12.7 GB RAM / 14.5 GB T4）或其他低 RAM 环境时启用。AutoDL 31.5 GB 余量大不需要。
+
+**推理高峰 RAM 拆解**（121 claims × Track 2 RAG，实测预估）：
+
+| 组件 | RAM | 占比 | 优化空间 |
+|---|---|---|---|
+| Python + torch + transformers + ms-swift | 3.0 GB | 26% | 难压缩 |
+| `evidence` dict (1.2M passages) | 1.5 GB | 13% | mmap-based lazy lookup |
+| **FAISS `IndexFlatIP`（全 load）** | **5.0 GB** | **43%** | **`IO_FLAG_MMAP` 直接 −3 GB** |
+| BM25 sparse arrays | 0.5 GB | 4% | 难压缩 |
+| Pipeline + reranker buffers | 0.5 GB | 4% | — |
+| Python overhead | 1.0 GB | 9% | — |
+| **峰值 / Peak** | **~11.5 GB** | — | — |
+
+**优化选项**（按 ROI 排序）：
+
+1. **`faiss.IO_FLAG_MMAP`**（首选，−3 GB，0 精度损失）：
+   修改 `src/retrieval/dense.py:DenseRetriever.load` 加 `mmap: bool = True` 参数，
+   传 `faiss.IO_FLAG_MMAP` 给 `faiss.read_index`。AutoDL 上 mmap 也无副作用
+   （Linux 文件缓存自动管理）。
+2. **替换 dense 模型 `bge-m3` (1024-d) → `bge-small-en-v1.5` (384-d)**（−3 GB 额外，−5 to −10pp recall）：
+   notebook cell-2-2-code 把 `DEFAULT_MODEL` 换成 `LIGHT_MODEL`。索引重 build (~5 min)。
+   降级路径，正式数字保留 bge-m3。
+3. **Evidence dict lazy lookup**（−1.5 GB，+5ms/claim）：
+   实现 `EvidenceStore` 用 byte-offset 索引，按需 `pread()` 读 evidence.json。
+   代码量中等，节省有限，优先级低。
+4. **FAISS `IndexIVFFlat` 量化版**（−3.5 GB，−2 to −3pp recall）：
+   重 build 索引为 IVF + PQ 量化。精度损失可接受但需要重训 IVF 中心，目前不值得做。
+
+**测试方式**（未来真要做时）：
+
+```bash
+# 在 Colab Free 实例上
+python -c "
+import psutil, faiss
+mem_before = psutil.virtual_memory().used / 1e9
+idx = faiss.read_index('outputs/dense_index/faiss.index', faiss.IO_FLAG_MMAP)
+mem_after = psutil.virtual_memory().used / 1e9
+print(f'mmap load: {(mem_after - mem_before):.2f} GB resident')
+# 期望 < 2 GB vs 默认 ~5 GB
+"
+```
+
+**审计记录**：2026-05-12 PM Session 13 末 user 询问 Colab 兼容性后捕获。当前 SFT 训练 + 评估全在 AutoDL（不阻塞主线）。等 Phase 6 final report 阶段如果要重现性测试，再评估是否需要 mmap + bge-small 降级在 Colab 跑一遍 baseline。
 
 ---
 

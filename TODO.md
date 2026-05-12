@@ -149,6 +149,13 @@ swift export --adapters /root/autodl-tmp/nlp_a3_cache/sft-out/<v5-*>/checkpoint-
 - non-NEI acc ≥ 0.45（不再 0.06 崩盘）
 - HM ≥ 0.25
 
+### 📋 Deferred — 推理 RAM 优化（Colab 兼容性）
+
+不阻塞主线，记账。当且仅当从 AutoDL（31.5 GB RAM）切回 Colab Free
+（12.7 GB RAM）才需要。主要 lever：`faiss.IO_FLAG_MMAP`（−3 GB RAM, 0
+精度损失）。详细审计 + 4 个优化选项 + 测试方式见 `optimization_plan.md`
+§8.1。
+
 ### 🎯 Step 8 — Track 3 评估（v3 SFT 训完后）
 
 ```bash
