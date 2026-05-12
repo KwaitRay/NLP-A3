@@ -255,7 +255,7 @@ def build_pipeline(evidence: dict, *, final_k: int = 20):
 
 def load_model_and_tokenizer(model_dir: str | None):
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers import AutoTokenizer, BitsAndBytesConfig
     if model_dir is None:
         # 1. Prefer pre-downloaded local copy under models/Qwen3.5-4B/
         #    (via scripts.download_models)
@@ -279,10 +279,36 @@ def load_model_and_tokenizer(model_dir: str | None):
         bnb_4bit_compute_dtype=compute_dtype, bnb_4bit_use_double_quant=True,
     )
     tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_dir, quantization_config=bnb_cfg, device_map="auto",
-        trust_remote_code=True, torch_dtype=compute_dtype,
-    )
+
+    # Qwen3.5 is a thinking-VL model. AutoModelForCausalLM resolves to
+    # Qwen3_5ForCausalLM (pure-LM, structure `model.layers.X`), but ms-swift
+    # trains the SFT adapter against Qwen3_5VLForConditionalGeneration
+    # (structure `model.language_model.layers.X` — extra wrapper). When we
+    # try `PeftModel.from_pretrained(base, sft_adapter)` against the pure-LM
+    # variant, target_modules regex fails to match AND the adapter state-dict
+    # keys carry `language_model.` which never aligns at load time → silent
+    # LoRA-not-applied. AutoModelForImageTextToText (transformers 5.x) loads
+    # the full VL wrapper so both regex and state-dict keys line up.
+    #
+    # Cost: +visual encoder weights in 4-bit (~few hundred MB extra VRAM),
+    # but no compute cost during text-only inference (visual branch never
+    # invoked). On 4080 SUPER with 31.5 GB this is negligible.
+    try:
+        from transformers import AutoModelForImageTextToText
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_dir, quantization_config=bnb_cfg, device_map="auto",
+            trust_remote_code=True, torch_dtype=compute_dtype,
+        )
+        print(f"  loaded as {type(model).__name__} (VL wrapper preserved)")
+    except (ImportError, ValueError) as e:
+        # Fallback for older transformers / non-VL checkpoints.
+        from transformers import AutoModelForCausalLM
+        print(f"  AutoModelForImageTextToText unavailable ({e!r}); "
+              f"falling back to AutoModelForCausalLM")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir, quantization_config=bnb_cfg, device_map="auto",
+            trust_remote_code=True, torch_dtype=compute_dtype,
+        )
     model.eval()
     return model, tokenizer
 
