@@ -2,6 +2,126 @@
 
 > Live status tracker. Update when crossing milestones. Plan in `~/.claude/plans/fancy-mapping-lemur.md`.
 
+## 2026-05-12 — Session 12 (SFT training kickoff — env-stack 三连碰 + Track 3 wiring)
+
+From "v2 data built, ready to train" to "training actually started" took
+three independent env-stack discoveries + a 4-loop JupyterLab autosave war,
+all logged into debug_log 复用经验 27-30. Training is now running; this
+entry records the full path so future-me / collaborators don't redo it.
+
+### Env-stack 三连碰
+
+1. **ms-swift 4.2.0 × torch 2.5.1 = FSDP2 ImportError** (复用经验 27):
+   `swift/callbacks/activation_cpu_offload.py` 在 module-load 期 import
+   `torch.distributed.fsdp.FSDPModule` (torch 2.6+ API). AutoDL 镜像锁
+   torch 2.5.1+cu124 (debug_log Issue 13 历史决策)，不能升 torch (会破
+   flash-attn 2.x / bitsandbytes / fla 全栈). Decision: **不降 ms-swift**
+   (会丢 `--tuner_type` + thinking 三件套), **不升 torch** (破栈), 而是
+   写 `scripts/patch_swift_fsdp2.py` 把那一行 import 包成 try/except + stub.
+   Idempotent, callback 用不到所以 stub 永远不被实例化. Wired 到
+   `cell-autodl-setup-2` 自动调用，新建 AutoDL 实例不再撞.
+
+2. **transformers 5.2 model_type 'qwen3_5' KeyError** (复用经验 11 已知，
+   但 setup-2 没 pin 落地):
+   `requirements.txt` 之前没 hard-pin transformers，pip 装到 4.x →
+   AutoConfig 不认识 qwen3_5. Fix: pin `transformers==5.2.*` per
+   `materials/qwen3.5_key_points.docx` (5.1 缺 qwen3_5, 5.3 视频坏).
+   重装后 model_type 识别 OK.
+
+3. **peft × transformers 5.2 = HybridCache ImportError** (复用经验 28，新):
+   transformers 5.x 删了 `HybridCache`，但 peft 0.14 还硬编码
+   `from transformers import HybridCache`. Diagnosis 被误导一次—
+   `patch_swift_fsdp2.py` 的 `try: import swift` 笼统 catch 报 "ms-swift
+   not installed"，真正错误在 traceback 倒数第 2 行. Fix: `pip install -U peft`
+   到 0.17+ (post-HybridCache-removal). 已记 TODO 改 patch 脚本的 error UX.
+
+### JupyterLab autosave vs git pull 4-loop deadlock (复用经验 29)
+
+用户撞了 4 次完全相同的错：
+
+```
+error: Your local changes to the following files would be overwritten by merge:
+        notebooks/notebook_autodl.ipynb
+```
+
+试过 `git checkout --`、`git stash` (×2)、`rm + git checkout HEAD --` (×2)，
+全部失败。根因：JupyterLab 那个 notebook 还在浏览器开着，每 ~30s autosave
+把内存 cell outputs 写回磁盘 — git pull 永远追不上 autosave 节奏.
+
+Resolution recipe:
+1. JupyterLab UI: `File → Close and Shut Down Notebook` (必须 Shut Down)
+2. 终端: `git fetch origin main && git reset --hard origin/main`
+3. JupyterLab 重开 + Restart Kernel
+
+Long-term fix: `nbstripout --install` 装 git filter 自动剥 outputs. 已
+加进 `requirements.txt` (torch 2.5 / 2.6 两份).
+
+### Requirements 拆分 (2 files)
+
+- `requirements.txt` (torch 2.5.1 default): `ms-swift==4.2.0` hard pin +
+  必跑 `python -m scripts.patch_swift_fsdp2` 后处理 + `nbstripout`.
+- `requirements-torch26.txt` (future torch 2.6+): `ms-swift>=4.2.0`
+  unpinned (FSDP2 native), 推荐 flash-attn 2.8.3.
+
+两份都 pin `transformers==5.2.*` + `qwen_vl_utils>=0.0.14` (Qwen3.5 必需，
+与 torch 无关). 跨场景部署不用猜.
+
+### SFT 启动 + loss 读法 (复用经验 30)
+
+Training kicked off at 2026-05-12 ~04:05 UTC, target run dir
+`/root/autodl-tmp/nlp_a3_cache/sft-out/v4-20260512-040505/`. 配置:
+
+```
+QLoRA 4-bit (NF4 + bf16 compute)
+LoRA r=16 / α=32 / dropout 0.05 / target_modules=all-linear
+BS=2 × GA=8 (eff_bs=16), lr 2e-4 + warmup 0.03
+max_len=1536, gradient_checkpointing on, liger_kernel on, group_by_length on
+thinking 三件套: --enable_thinking false / --add_non_thinking_prefix true
+                 / --loss_scale ignore_empty_think
+3 epochs × 4166 records / 16 = 783 steps
+save_steps=200, eval_steps=200, save_total_limit=3
+```
+
+实测 step 1 loss 0.1146 → step 25 loss 0.019 → step 35 loss 0.010.
+**Loss 低不是 bug** — prompt masking + 短响应 ('LABEL ##[..]##' ≈ 8 tokens)
++ base 模型已认识 4 个 LABEL 词. 真信号看 Track 3 vs 2 acc/HM delta.
+VRAM 11.4 GB / 31.5 GB (余量 20 GB), ~19 s/step (稳态), 预估 ~4h 总.
+
+### Track 3 wired into phase1_eval
+
+`scripts/phase1_eval.py` 加 `--sft-adapter PATH` flag:
+- `PeftModel.from_pretrained(base_model, adapter_path)` 原地包装 (不开第二
+  份 base 占 VRAM)
+- `--tracks 3` 强制 require adapter，校验在加载模型之前 fire
+- Track 3 复用 run_track2 (同 RAG pipeline, 同 ZeroShotInferer, 只换 model)
+- 输出 `track3_{prompt}_{dataset}.{json,md}`, diagnose_phase1 自动 discover
+
+训完一行命令直接拿对比:
+```
+python -m scripts.phase1_eval --tracks 2,3 --prompts v1 --dataset diag_test \
+    --sft-adapter /root/autodl-tmp/nlp_a3_cache/sft-out/v4-20260512-040505/checkpoint-final
+python -m scripts.diagnose_phase1 --dataset diag_test
+```
+
+### 关键决策回顾
+
+| 决策 | 选择 | 替代方案 (rejected) | Why |
+|---|---|---|---|
+| ms-swift 4.2.0 vs older | 4.2.0 + patch | 降到 < 4.2 (掉到 swift/llm/ 老布局) | 老布局没 `--tuner_type` / thinking 三件套，等于回到 Issue 9 初态 |
+| torch 2.5 vs 2.6 | 留 2.5 | 升到 2.6+ | 升 torch 破 flash-attn 2.x / bitsandbytes / fla 全栈 (Issue 13 教训) |
+| FSDP2 callback 处理 | patch import 为 optional + stub | 删整个 callback / 改 ms-swift fork | callback 用不到，patch 1 行最干净 |
+| transformers 5.x | pin 5.2.* | 留 4.x | qwen3.5 model_type 在 5.0 才注册，4.x 不识别 |
+| jupyter notebook git 卫生 | nbstripout | 手动 strip / 不 commit notebook | 自动化 0 维护成本 |
+| Track 3 实现 | phase1_eval --sft-adapter | 在 notebook 里手写 | 命令行 + 自动 diagnose 比 notebook 灵活，无 kernel restart 摩擦 |
+
+### 下次 session 第一句话
+
+AutoDL 上 `ls /root/autodl-tmp/nlp_a3_cache/sft-out/v4-20260512-040505/`
+确认 checkpoint-final 存在 → `phase1_eval --tracks 2,3 --sft-adapter ...`
+→ 把 `diagnose_diag_test.md` 的 cross-run summary 表（含 Track 2 / 3 对比）
++ Track 3 per-label correctness 表贴回来。**关键指标：NEI acc 是否 ≥ 0.40，
+HM 是否 ≥ 0.28**。
+
 ## 2026-05-12 — Session 11 (v2 SFT data built + notebook patched for AutoDL SFT kickoff)
 
 The path from "Phase 4 implementation pushed" to "SFT is actually about to

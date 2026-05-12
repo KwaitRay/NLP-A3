@@ -982,6 +982,33 @@ outputs/eval_compare.md          # markdown 对比表带 Δ 列
 - **适用边界**：仅适用于 **single-file** `pytorch_model.bin` 布局（如 bge-m3、bge-reranker-base、bge-small-en-v1.5）。**Sharded** `pytorch_model-*-of-*.bin` 需要同步重生成 `pytorch_model.bin.index.json` 的 weight_map，脚本主动 warn 并跳过——这种情形请改走 hf-mirror.com 镜像重下。Qwen3.5-4B 是 sharded safetensors，无此问题。
 - **关联**：debug_log 问题 16；optimization_plan §7.2 / §8。
 
+### D-017：环境栈锁定（2026-05-12，Phase 5 SFT 启动前）
+
+- **决策**：把 AutoDL 上跑 SFT 的整套依赖矩阵冻结成两份 requirements 文件 + 一个 patch 脚本，避免下次重建实例时再撞同一个连环坑（FSDP2 / qwen3_5 model_type / HybridCache）。
+
+| 组件 | torch 2.5.1（当前 AutoDL 默认） | torch 2.6+（未来 / 高端集群） | 锁定原因 |
+|---|---|---|---|
+| `torch` | **2.5.1+cu124**（不动） | 2.6.x+ | D-013 + debug_log Issue 13：flash-attn 2.x / bitsandbytes / fla 全栈靠 2.5 编译 |
+| `ms-swift` | **==4.2.0**（hard pin）+ FSDP2 patch | `>=4.2.0` 浮动 | 4.2.0 有 `--tuner_type` / `--enable_thinking` / `--add_non_thinking_prefix` / `--loss_scale ignore_empty_think` 四个 Qwen3.5 必备 CLI flag；4.1.x 老布局没有 |
+| `transformers` | **==5.2.\***（two files 共同） | **==5.2.\*** | `qwen3_5` model_type 5.0 才注册；5.3.\* 视频 dataloader 坏（per `materials/qwen3.5_key_points.docx`） |
+| `peft` | **`pip install -U peft`** (≥ 0.17, 自动) | 同左 | transformers 5.x 删了 `HybridCache`，peft < 0.17 硬编码引用会 ImportError（debug_log 复用经验 28） |
+| `qwen_vl_utils` | **>=0.0.14** | 同 | Qwen3.5 是 mixed-thinking VL 模型，加载时 sanity check |
+| `liger-kernel` | >=0.5.0 | 同 | `--use_liger_kernel true` 省 10-20% VRAM |
+| `bitsandbytes` | >=0.45.0（实测 0.49.2） | 同 | QLoRA 4-bit |
+| `flash-attn` | 可选（不在 r.txt） | **2.8.3** 推荐 | torch 2.6+ wheels 充足、Ampere+ 加速 |
+| FSDP2 patch | **必跑** `scripts/patch_swift_fsdp2.py` | 不需要 | ms-swift 4.2 import `torch.distributed.fsdp.FSDPModule`（2.6+ API） |
+| `nbstripout` | **必装** + `nbstripout --install` | 同 | 防 JupyterLab autosave vs git pull 死锁（复用经验 29） |
+
+- **替代（被否决）**：
+  1. **升 torch 到 2.6+，跟着 ms-swift / flash-attn 全栈升** → flash-attn 2.x 编译 wheel 不齐全 / bitsandbytes 不一定兼容；D-013 + Issue 13 已选 2.5 stable 路线，重新整套验证 1-2 天，价值不大
+  2. **降 ms-swift 到 < 4.2** → 实测掉到 `swift/llm/` 老布局，所有 v3.6+ CLI flag 消失（debug_log Session 12 调研），等于回到 Issue 9 初态
+  3. **不锁版本，每次按需 `pip install -U`** → 已被 Session 12 反复证伪：peft / transformers 不同步升级时 import chain 必爆
+- **理由**：
+  1. 这套版本组合在 Session 12 实测能让 ms-swift 4.2 + Qwen3.5-4B QLoRA SFT 跑起来（step 1 loss 0.1146 → step 35 loss 0.010 / VRAM 11.4 GB / ~19 s/step）。是 Phase 5 训练的可重现 baseline。
+  2. `requirements-torch26.txt` 提前准备好的，等 AutoDL 镜像升 torch 2.6 后只需切文件，不用从零调研。
+  3. 把 `nbstripout` 列为依赖而非"建议"，是因为 Session 12 这次 4-loop 死锁浪费了 30 分钟；自动化 0 维护成本，新人 onboarding 不会再撞。
+- **关联**：`requirements.txt` / `requirements-torch26.txt` / `scripts/patch_swift_fsdp2.py`；debug_log 复用经验 27-29；optimization_plan §10 决策日志 2026-05-12 "Env stack locked" 一行。
+
 ---
 
 ## 18. 术语表

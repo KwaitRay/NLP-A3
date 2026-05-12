@@ -577,15 +577,27 @@ AutoDL boxes; submission zip carries only small artifacts.
 - [x] **清理仓库内残留 `Qwen3___5-4B` 路径**（5 处）→ 统一用 `Qwen3.5-4B`。
       详见 `debug_log.md` 复用经验 26。
 
+- [x] **AutoDL SFT v2 训练启动**（2026-05-12 ~04:05 UTC）：env stack 三连碰
+      （FSDP2 / transformers 5.2 / peft HybridCache，详见 debug_log 复用经验
+      27-28）全部解决；nbstripout 装好挡 jupyter autosave（复用经验 29）；
+      `scripts/patch_swift_fsdp2.py` 落地。训练开跑：step 1 loss 0.1146 →
+      step 25 loss 0.019，grad_norm 健康，VRAM 11.4 GB / 31.5 GB，预估 ~4h。
+- [x] **phase1_eval Track 3 支持**：`--sft-adapter PATH` flag 实现 + 校验。
+      SFT 训完直接 `python -m scripts.phase1_eval --tracks 2,3 --sft-adapter ...`
+      端到端拿到 Track 2 vs 3 对比。
+
 ### 进行中 / In progress
-- [ ] **AutoDL 上启动 SFT v2 训练**：`source /etc/network_turbo && git pull` →
-      重启 kernel → 顺序跑 setup + sec2-5-download (cache hit) + sec2-5-train
-      → 取消 `!{cmd}` 注释启动训练（~30-45 min on 4080 SUPER）。
-      *Trigger SFT v2 training on AutoDL; expect ~780 steps × ~1 it/s.*
+- [ ] **等 SFT 训练完成**（~30-45 min 剩余，2026-05-12 ~08:00 UTC 预计）：
+      `outputs/sft-out/v4-20260512-040505/checkpoint-final/` 落盘后立刻跑
+      Track 2 vs 3 head-to-head。
 
 ### 待做 / Todo
-- [ ] 训完跑 Track 3（base + SFT + RAG）端到端评估，对比 Track 2 v1 (HM 0.203)
-- [ ] DPO 训练（dev_holdout 错样本 + `synthesise_disputed_contrast`）
+- [ ] **Track 3 评估**（训完立刻）：`python -m scripts.phase1_eval --tracks 2,3 \
+      --prompts v1 --dataset diag_test --sft-adapter <ckpt>` + diagnose。
+      关注：NEI acc 0.025 → ≥ 0.40？non-NEI acc 0.580 → 不退 5pp 以上？
+      总 HM 0.203 → ≥ 0.28？
+- [ ] DPO 训练（dev_holdout 错样本 + `synthesise_disputed_contrast`，
+      代码在 `src/dpo_pairs.py` 已写好）
 - [ ] Phase 5 4-track 完整对比 + 锁定 production 模型
 - [ ] Phase 6：official dev 终评 + test 集预测 + 报告
 
@@ -607,6 +619,9 @@ AutoDL boxes; submission zip carries only small artifacts.
 | 2026-05-12 | Phase 4 implementation | `build_dataset` 加 `weak_buckets` 参数；`build_stage0` 内置 `{nei_underspec:4, disputed_conflict:2, refutes_clear:2}`；tests 全绿。SFT 数据待重建。 | `src/sft_dataset.py`, `src/build_stage0.py`, `tests/test_sft_dataset.py` |
 | 2026-05-12 | SFT data v2 built (本地) | `sft_train_v2.jsonl` 4166 records（×2.11 over v1）。weak_buckets 100% 按预期触发：nei_underspec 303→1212, disputed_conflict 90→180, refutes_clear 98→196。NEI label 占比 65.4%→79.1%，hard difficulty 占比 14.3%→24.1%。n_shown ≈ k=20。 | `outputs/sft_data/sft_train_v2.jsonl` |
 | 2026-05-12 | AutoDL SFT 启动准备 | notebook_autodl.ipynb 9 cell 修补：cache-first 模型加载（解决 8 GB 重复下载）+ ms-swift v3.6+ CLI 命名（`--tuner_type` / `--quant_bits` / thinking trio + liger + group_by_length + save_total_limit）+ DATA_PATH→v2 + MAX_LEN 1024→1536（容纳 k=20 prompt）。清掉 `Qwen3___5-4B` 残留 5 处。AutoDL pull 用 `source /etc/network_turbo` 走官方加速通道。 | `notebooks/notebook_autodl.ipynb`, `debug_log.md 复用经验 24-26` |
+| 2026-05-12 | Env stack locked | torch 2.5.1+cu124 + ms-swift 4.2.0 + transformers 5.2.0 + peft (latest, post-HybridCache-removal) + qwen_vl_utils 0.0.14+ + liger-kernel + bitsandbytes 0.49+。FSDP2 patch (`scripts/patch_swift_fsdp2.py`) 把 ms-swift 4.2 对 torch 2.6 API 的硬依赖打成可选。`requirements.txt` 拆 torch 2.5（默认）+ `requirements-torch26.txt`（未来）。`nbstripout` 加入 dev deps 防 jupyter autosave 与 git pull 死锁（debug_log 复用经验 27/28/29）。 | `requirements.txt`, `requirements-torch26.txt`, `scripts/patch_swift_fsdp2.py`, `debug_log.md` 复用经验 27-29 |
+| 2026-05-12 | SFT v2 kickoff | 训练参数：LoRA r=16 / α=32，QLoRA 4-bit + bf16，BS=2 ×GA=8 (eff 16)，lr 2e-4 + warmup 0.03，max_len 1536，liger_kernel + group_by_length + save_total_limit=3，thinking 三件套 (--enable_thinking false / --add_non_thinking_prefix true / --loss_scale ignore_empty_think)，3 epochs / 783 steps。Step 1 loss 0.1146 / step 25 loss 0.019 / VRAM 11.4 GB / ~19 s/step (4080 SUPER) / 预估 ~4h 总。Loss 低是 prompt-masking 正常表现（debug_log 复用经验 30），真信号看 Track 3 vs 2 metric delta。 | SFT stdout log，checkpoint 路径 `nlp_a3_cache/sft-out/v4-20260512-040505/` |
+| 2026-05-12 | phase1_eval Track 3 wired | 新增 `--sft-adapter PATH` flag → `PeftModel.from_pretrained(base, path)` 原地包装。`--tracks 3` 强制 require adapter。Track 3 = base + SFT + RAG (k=20)，复用 ZeroShotInferer。诊断脚本 / write_summary 自动支持 track3_* 文件 prefix。 | `scripts/phase1_eval.py` |
 | TBD | SFT v2 training done | Δ HM vs Track 2 v1 (0.203); NEI acc 0.025 → ?；non-NEI acc 0.580 → ? | `outputs/sft-out/checkpoint-final` + diagnose_phase1 post-SFT 报告 |
 | TBD | Phase 2 done | 锁定 prompt: v?  Track 2 HM 提升 +? | `outputs/eval_phase1/summary_diag_test.md` |
 | TBD | Phase 4 done | weak_buckets 配比: {...} → sft_train_v2.jsonl | `outputs/sft_data/sft_train_v2_meta.json` |

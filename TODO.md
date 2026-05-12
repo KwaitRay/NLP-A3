@@ -3,7 +3,7 @@
 > 单页"明天打开就知道做什么"的快速恢复文档。
 > 完整计划见 `optimization_plan.md`，本文只列**接下来一步要做什么**。
 >
-> 最后更新: 2026-05-12 凌晨（v2 SFT 数据本地构建完成 + notebook 修复 + AutoDL 准备启动 SFT）
+> 最后更新: 2026-05-12 早晨（SFT v2 训练已启动，~4h 跑完。Track 3 评估 wire 完成）
 
 ---
 
@@ -47,6 +47,18 @@
 - [x] **清理仓库 `Qwen3___5-4B` 残留 5 处** → 全部统一为 `Qwen3.5-4B`（见 debug_log 复用经验 26）
 - [x] **AutoDL GFW workaround 落实**：`source /etc/network_turbo` 加速 github pull
       （debug_log 复用经验 25）
+- [x] **env-stack 三连碰全部解决**（debug_log 复用经验 27-28）：
+  - FSDP2 ImportError on torch 2.5.1 → `scripts/patch_swift_fsdp2.py` (patch + sentinel + idempotent)
+  - transformers `qwen3_5` model_type KeyError → pin `transformers==5.2.*`
+  - peft × transformers 5.2 HybridCache 不兼容 → `pip install -U peft` 到 0.17+
+- [x] **requirements 拆分**：`requirements.txt`（torch 2.5 默认）+ `requirements-torch26.txt`（未来）
+- [x] **nbstripout 加入 deps**（debug_log 复用经验 29）— 解决 JupyterLab autosave vs git pull 死锁
+- [x] **SFT v2 训练启动**（2026-05-12 ~04:05 UTC）：
+  - 783 steps，step 1 loss 0.1146 → step 35 loss 0.010，grad_norm 健康，VRAM 11.4 GB / 31.5 GB
+  - 配置：LoRA r=16，QLoRA 4-bit，BS=2×GA=8，lr 2e-4，max_len 1536，liger_kernel
+  - thinking 三件套 + group_by_length + save_total_limit=3
+  - 预估 ~4h 完成，checkpoint 落 `nlp_a3_cache/sft-out/v4-20260512-040505/`
+- [x] **`scripts/phase1_eval.py` 加 `--sft-adapter` flag**：Track 3 (base+SFT+RAG) 端到端评估
 
 ---
 
@@ -92,30 +104,62 @@ refutes_clear ×2)。AutoDL 上需要重跑 `python -m src.build_stage0 --force`
 确保 train/inference 一致（`outputs/sft_data/*.jsonl` 在 .gitignore 里 → git
 不传，AutoDL 必须本地重建或 `scp` 传过去）。
 
-### 🎯 Step 6 — AutoDL 启动 SFT 训练（**当前最优先**）
+### ✅ Step 6 — SFT v2 训练已启动（2026-05-12 ~04:05 UTC）
+
+训练在 `nlp_a3_cache/sft-out/v4-20260512-040505/` 跑，~4h，等 checkpoint-final 落盘。
+
+### 🎯 Step 7 — Track 3 评估（**等 SFT 训完立刻做**）
 
 ```bash
 # AutoDL 上
-source /etc/network_turbo          # 走官方加速通道（debug_log 复用经验 25）
+source /etc/network_turbo
 cd ~/autodl-tmp/NLP-A3
-git pull origin main               # 拿到 notebook 9 cells 修复版本
 
-# 重建 v2 SFT 数据（本地已验证 4166 records 正确）
-python -m src.build_stage0 --force
-ls -la outputs/sft_data/sft_*_v2.jsonl
+# 1. 确认 checkpoint 存在
+ls -la /root/autodl-tmp/nlp_a3_cache/sft-out/v4-20260512-040505/
+
+# 2. 软链到稳定路径（方便引用）
+ln -sf /root/autodl-tmp/nlp_a3_cache/sft-out/v4-20260512-040505/checkpoint-final \
+       /root/autodl-tmp/nlp_a3_cache/sft-out/checkpoint-final
+
+# 3. Track 2 vs 3 head-to-head（~10 min）
+python -m scripts.phase1_eval --tracks 2,3 --prompts v1 --dataset diag_test \
+    --sft-adapter /root/autodl-tmp/nlp_a3_cache/sft-out/checkpoint-final
+
+# 4. 诊断（< 5s）
+python -m scripts.diagnose_phase1 --dataset diag_test
 ```
 
-然后在 JupyterLab 里：
-1. **Close + reopen `notebook_autodl.ipynb`**（强制 reload 新 cell 源码）
-2. `Kernel` → `Restart Kernel`
-3. 顺序跑：4 个 setup cell → `sec2-5-download`（应秒回 `[cache] using .../models/Qwen3.5-4B`）
-4. 跑 `sec2-5-train`：先看 `print(cmd)` 输出，确认含 `--tuner_type lora` /
-   `--enable_thinking false` / `--dataset .../sft_train_v2.jsonl`
-5. 取消 `# !{cmd}` 注释（去掉 `# `），重跑 cell 启动训练
+**关键判定指标**（对比 Track 2 v1 baseline HM 0.203，per-label acc S 0.737 / R 0.682 / NEI 0.025 / D 0.190）：
 
-预计 ~30-45 min on 4080 SUPER（3 epochs × 4166 samples / eff_bs 16 ≈ 780 steps × ~1 it/s）。
+| 指标 | Track 2 v1 (base+RAG) | Track 3 (期望) | 达成判定 |
+|---|---|---|---|
+| **NEI acc** | 0.025 | **≥ 0.40** | 硬约束 §0.5.3.1 兑现 |
+| non-NEI acc | 0.580 | 不跌 5pp 以上 | SFT 没 over-correct |
+| 总 HM | 0.203 | **≥ 0.28** | Phase 4 红利至少 +0.08 |
+| Δ HM (Track 3 − Track 2) | — | ≥ +0.05 | SFT 端到端有效 |
 
-SFT 配置详见 `optimization_plan.md §5.1`。
+读 `outputs/eval_phase1/diagnose_diag_test.md` cross-run summary 表 +
+Track 3 confusion matrix。
+
+### Step 8 — DPO 训练（Track 4 准备）
+
+`src/dpo_pairs.py` 已实现 `synthesise_disputed_contrast`，但还没写 driver
+脚本。等 Track 3 确认 SFT 有效后启动 —— 大概路径：
+
+```bash
+# 1. 从 dev_holdout 上 SFT 模型的错预测挖 chosen/rejected 对
+python -m src.dpo_pairs  # （此 entry 待写）
+
+# 2. swift rlhf --rlhf_type dpo （cell-2-6-code 已就绪）
+```
+
+### Step 9 — 4-track 完整对比 + 锁定 production
+
+```bash
+python -m scripts.phase1_eval --tracks 1,2,3,4 --prompts v1 --dataset diag_test \
+    --sft-adapter ... --dpo-adapter ...    # --dpo-adapter 待加
+```
 
 ```bash
 # ms-swift CLI（参考 notebook cell-2-sft-train，已在 debug_log Issue 9-12 调通）
@@ -209,4 +253,4 @@ python -m scripts.build_indexes
 
 ---
 
-**下次 session 第一句话**：AutoDL 上 SFT 训练跑起来了，把第一个 epoch 头 100 step 的 loss 曲线 + final checkpoint 路径贴回来。然后我加 `--sft-adapter` flag 到 `phase1_eval.py` 跑端到端 Track 3 评估，看 NEI acc 是否从 0.025 拉到 ≥ 0.40。
+**下次 session 第一句话**：AutoDL 上 SFT 训完了，跑 `python -m scripts.phase1_eval --tracks 2,3 --prompts v1 --dataset diag_test --sft-adapter /root/autodl-tmp/nlp_a3_cache/sft-out/checkpoint-final` 再 `python -m scripts.diagnose_phase1 --dataset diag_test`。把 cross-run summary 表 + Track 3 confusion matrix 贴回来 —— 关键看 NEI acc 是否 ≥ 0.40，HM 是否 ≥ 0.28。

@@ -1282,5 +1282,129 @@ swift.callbacks.activation_cpu_offload → from torch.distributed.fsdp import FS
 2. 看 `materials/swift版本适配.docx` 的版本矩阵确认 torch 与 ms-swift 哪个特性绑哪个 torch 版本
 3. **不要因为单个文件 import 失败就降整个库** —— 看清楚 callback 是不是真用得到（90% 训练命令用不到 FSDP / activation offload），patch 一行远比降版本干净
 
+### 28. peft × transformers 5.2 — `HybridCache` 被移除，老 peft 硬引用炸
+
+**症状**（2026-05-12 SFT 启动时第二次冒）：
+
+```
+ImportError: cannot import name 'HybridCache' from 'transformers'
+  (.../transformers/__init__.py)
+File ".../peft/peft_model.py:37"
+  from transformers import Cache, DynamicCache, EncoderDecoderCache, HybridCache, ...
+```
+
+**追踪**：`import swift` → `transformers.trainer_utils` → `peft.peft_model` → `from transformers import HybridCache` ✗
+
+但 `pip show transformers` 已经是 **5.2.0**，`qwen3_5` model_type 也能识别 —— **transformers 5.2 故意移除了 `HybridCache`**（cache 系统重做），但 peft < 0.17 还硬编码引用它。
+
+**根因**：transformers 4.x → 5.x 是 breaking-change major bump，cache 类被重命名 / 移到 `transformers.cache_utils`。peft 必须出新版同步。
+
+**误导**：`scripts/patch_swift_fsdp2.py` 的 generic try/except `import swift` → 笼统报 "ms-swift not installed in this environment"。真正错误得看 `python -c "import swift"` 的完整 traceback 倒数第 2 行（`ImportError: cannot import name '<X>' from 'transformers'`）才看得到。**Lesson**: patch 脚本的 except handler 应该 print 完整 chained exception，不要只看顶层。
+
+**修复**：
+
+```bash
+source /etc/network_turbo
+pip install -U peft -i https://pypi.tuna.tsinghua.edu.cn/simple
+# 实测 peft 0.17+ 兼容 transformers 5.2.* （删去了 HybridCache 引用）
+python -c "from peft import PeftModel; import swift; print('OK')"
+```
+
+**已落到 requirements.txt**：之前只 pin `peft>=0.14.0`，上限不够紧；改成 `peft>=0.14.0` 不动（pip 自动取最新；但 AutoDL 上要 force-reinstall 时记得手动 `-U`）。
+
+**复用要点**：
+
+1. **transformers 5.x 是 breaking change，所有依赖 transformers 的库（peft / trl / accelerate）都要同步升**。pin transformers 时必须 pin 所有"transformers-aware"依赖到 5.x-兼容版本。
+2. **诊断 chained ImportError 看倒数第 2 行**，不要看 traceback 顶层（顶层永远只是触发点，根因在最深的 import）。
+3. **patch_swift_fsdp2 的报错 UX 应该改**：catch ImportError 时 print exception 的 full repr，不要笼统说"not installed"。低优先级 TODO。
+
+### 29. JupyterLab autosave vs git pull 死锁 — `nbstripout --install` 解，但要 close notebook
+
+**症状**（本次 session 撞了 4 次）：
+
+```
+$ git pull origin main
+error: Your local changes to the following files would be overwritten by merge:
+        notebooks/notebook_autodl.ipynb
+Please commit your changes or stash them before you merge.
+Aborting
+```
+
+`git stash` → 成功收到 stash → `git pull` 还冒同样错。`rm` + `git checkout HEAD --` → 也无效，立即又脏。
+
+**根因**：**JupyterLab 那个 notebook 还在浏览器里打开着**。JupyterLab 每 ~30 s autosave 一次，把内存里的 cell outputs / execution_count 写回 `.ipynb`。流程：
+
+```
+t=0  git checkout HEAD --   ← working tree 干净
+t=1  JupyterLab autosave    ← working tree 脏（outputs 回写）
+t=2  git pull               ← 报"would be overwritten"
+```
+
+**只要 JupyterLab tab 开着，git 永远追不上 autosave 的写入节奏**。
+
+**修复**（这条死循环正确解法，按顺序）：
+
+1. **JupyterLab UI：`File → Close and Shut Down Notebook`**（必须 Shut Down 杀 kernel，单 Close tab 不够，autosave background 还活着）
+2. 终端：`git fetch origin main && git reset --hard origin/main` （硬覆盖，绕开所有 dirty 检测）
+3. 验证：`git log --oneline -3` 看到远端 head；`ls scripts/*.py` 看到新文件
+4. JupyterLab 重新打开 notebook + Restart Kernel
+
+**长期解 — `nbstripout`**：
+
+```bash
+pip install nbstripout
+nbstripout --install   # 装到 .git/config 的 filter
+# 从此 git add 自动剥 jupyter outputs/execution_count；
+# JupyterLab autosave 再多次也不会触发 dirty。
+```
+
+**注意**：`nbstripout --install` 后**当前已脏的 working tree 不会自动变干净**，需要 `git add --renormalize .` 重规范化一次。
+
+**已落到 requirements.txt**（torch 2.5 + torch 2.6 两份都有），新建实例 `pip install -r requirements.txt` 完后跑一次 `nbstripout --install`。
+
+**复用要点**：
+
+1. **改 notebook 之前先在 JupyterLab UI 里 Shut Down 它**。kernel 还活着就别在终端做 git 操作。
+2. `git stash` 不能突破 autosave 循环 —— stash 之后 JupyterLab 立刻写回，下一秒又脏。
+3. `git reset --hard` 是终极武器，但**也只在 JupyterLab 关掉后才稳定有效**。
+4. 跨实例迁移项目时 `nbstripout --install` 是 0 成本卫生措施，建议加进 onboarding checklist。
+
+### 30. SFT 训练时 loss 看起来"太低"（0.01-0.1）不是 bug，是 prompt masking 的正常表现
+
+**实测**（2026-05-12 SFT v2 启动，step 1-35）：
+
+| step | loss | grad_norm | lr | epoch |
+|---|---|---|---|---|
+| 1  | 0.1146 | 3.79 | 8.3e-06 | 0.004 |
+| 5  | 0.0967 | 1.64 | 4.2e-05 | 0.019 |
+| 15 | 0.0221 | 0.21 | 1.3e-04 | 0.058 |
+| 25 | 0.0187 | 1.03 | 2.0e-04 | 0.096 |
+| 35 | 0.0105 | 0.07 | 2.0e-04 | 0.135 |
+
+第一反应："起点 0.11 太低了，是不是 loss masking 出问题？"
+
+**实际是正常**。原因：
+
+1. **SFT 只在 assistant 响应上算 loss**（system / user 的 ~1500 prompt tokens 全部 `loss_mask=0`，不参与 CE）
+2. **响应 = `LABEL ##[i,j]##` ≈ 5-10 tokens**，其中 4 个 LABEL token 是 SUPPORTS/REFUTES/NOT_ENOUGH_INFO/DISPUTED（base 模型本来就认识）
+3. 加上 `--loss_scale ignore_empty_think` 再 mask 掉空的 `<think></think>` 块 → 有效计算 token 更少
+4. base Qwen3.5 在给定 prompt context 下，对 LABEL token 的 prior probability 已经很高（4 选 1）→ 即使没训过，CE loss 也只有 ~0.5 量级
+5. 训了 25 step 之后 LoRA 已经学到 `LABEL ##[..]##` 这个固定输出格式 → loss < 0.05 是模型 99%+ confidence 输出格式正确
+
+**判定 SFT 是否真在学的正确方式**：
+
+- **不要看 loss 绝对值**（会被 masking 误导）
+- ✅ **看 Track 3 vs Track 2 的 acc / HM delta**（端到端指标才是真实信号）
+- ✅ 看 **NEI 类的 per-label acc**（base 0.025 → SFT 目标 ≥ 0.40，硬约束 §0.5.3.1）
+- ✅ 看 **non-NEI 类是否回退**（不应该从 0.580 跌到 0.40 以下，否则 SFT over-corrected）
+
+**复用要点**：
+
+1. **SFT loss 的"绝对值参考线"几乎没意义**，因为受 prompt/响应长度比、loss_mask、loss_scale 多重影响。永远用端到端任务指标判定。
+2. **第一次跑某个 SFT 配置时记下 step 1 / 5 / 25 / 100 的 loss 数字作为"健康指纹"**。再跑相同配置时偏离 > 50% 才需要警觉。
+3. **grad_norm 是 loss 的搭档指标**：维持 < 5 + 不发散即可；忽然 → 0 是 LoRA 已收敛或学不动，忽然 → 100 是数值不稳。
+4. 别把 loss 和 perplexity 混淆。SFT loss = per-token CE on UNMASKED tokens；perplexity 要 exp(loss)，但 masking 让 perplexity 也失真。
+
+
 
 
