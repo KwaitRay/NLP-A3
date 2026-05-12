@@ -113,3 +113,68 @@ class RetrievalPipeline:
                 pass
         chosen = ranked[:k]
         return [(eid, self.evidence.get(eid, "")) for eid, _ in chosen]
+
+    def retrieve_multi_query(
+        self,
+        primary_claim: str,
+        extra_queries: list[str],
+    ) -> list[tuple[str, str]]:
+        """Run BM25+dense on the primary claim AND each extra query, fuse all
+        candidate lists via RRF, then apply (optional) rerank + final_k.
+
+        Designed for LLM-augmented retrieval (Phase 3.5b HyDE / sub-claim):
+        the primary claim is the original text; extra_queries are HyDE
+        hypothetical passages and decomposed sub-claims. Each query
+        independently fetches `bm25_top` + `dense_top` candidates; the union
+        is fused with RRF across all `1 + len(extra_queries)` ranked lists.
+
+        RRF (not weighted_fuse) on the union side because:
+          - weighted_fuse requires consistent score scales across lists,
+            which fails when scores come from different query encodings
+          - RRF is scale-free and proven robust for multi-query union
+            (Cormack et al. 2009)
+
+        After fusion the pipeline is identical to `retrieve()`: optional
+        rerank → optional rule_reorder → top-k. So no need to duplicate
+        those stages here.
+        """
+        cfg = self.cfg
+        queries = [primary_claim] + [q for q in extra_queries if q and q != primary_claim]
+        all_lists: list[list[tuple[str, float]]] = []
+        for q in queries:
+            if cfg.use_bm25 and self.bm25:
+                all_lists.append(self.bm25.search(q, k=cfg.bm25_top))
+            if cfg.use_dense and self.dense:
+                all_lists.append(self.dense.search(q, k=cfg.dense_top))
+        if not all_lists:
+            return []
+        fused = rrf_fuse(*all_lists, top_k=cfg.fuse_top)
+
+        if cfg.use_rerank and self.reranker:
+            cands = [(eid, self.evidence.get(eid, "")) for eid, _ in fused[: cfg.rerank_top]]
+            reranked = self.reranker.rerank(primary_claim, cands)
+            tail = fused[cfg.rerank_top:]
+            ranked = reranked + tail
+        else:
+            ranked = fused
+
+        if cfg.use_rule_reorder:
+            entities = []
+            if cfg.claim_entities_lookup is not None:
+                entities = list(cfg.claim_entities_lookup(primary_claim) or [])
+            ranked = rule_reorder(
+                ranked,
+                evidence_corpus=self.evidence,
+                claim_entities=entities,
+                keep_top_k=cfg.rule_top,
+            )
+
+        k = cfg.final_k
+        if cfg.label_conditioned_k and cfg.nei_predictor is not None:
+            try:
+                if cfg.nei_predictor(primary_claim):
+                    k = cfg.nei_k
+            except Exception:
+                pass
+        chosen = ranked[:k]
+        return [(eid, self.evidence.get(eid, "")) for eid, _ in chosen]

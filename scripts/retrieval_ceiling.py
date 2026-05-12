@@ -25,8 +25,14 @@ Modes (selectable via --mode, comma-separated or `all`):
                 Multi-query: original claim alone vs claim + WordNet
                 synonym variants (`src.query_rewrite.synonym_expand`),
                 fused via RRF across all variants. Two configs.
+  llm_rewrite   Multi-query with LLM rewrites: baseline / HyDE only /
+                sub-claim only / HyDE + sub-claim. Requires
+                `outputs/query_rewrite/claim_rewrites.jsonl` from
+                `scripts.rewrite_queries`. Phase 3.5b escape hatch when
+                non-LLM modes can't push recall@20 past 0.50.
 
-  all           Run all four modes.
+  all           Run all five modes (NOTE: llm_rewrite needs cache built
+                first; otherwise it errors out).
 
 Output:
     outputs/eval_phase1/retrieval_ceiling_<dataset>.md  — per-mode tables
@@ -391,6 +397,104 @@ def run_mode_synonym_expand(gold, evidence, bm25, dense, reranker, *, use_rerank
     return rows
 
 
+def _load_llm_rewrites() -> dict[str, dict]:
+    """Load cached HyDE + sub-claim rewrites produced by scripts.rewrite_queries."""
+    cache_path = OUTPUTS_DIR / "query_rewrite" / "claim_rewrites.jsonl"
+    if not cache_path.exists():
+        raise SystemExit(
+            f"LLM rewrite cache not found at {cache_path}. "
+            f"Run `python -m scripts.rewrite_queries --splits diag_test` first."
+        )
+    out: dict[str, dict] = {}
+    import json
+    with cache_path.open(encoding="utf-8") as f:
+        for line in f:
+            rec = json.loads(line)
+            out[rec["claim_id"]] = rec
+    return out
+
+
+def run_mode_llm_rewrite(gold, evidence, bm25, dense, reranker, *, use_rerank: bool):
+    """LLM-driven multi-query (HyDE + sub-claim) vs baseline claim-only.
+
+    Requires `outputs/query_rewrite/claim_rewrites.jsonl` from
+    `scripts.rewrite_queries`. Each claim gets:
+      - baseline: 1 query (the claim itself)
+      - hyde_only: 2 queries (claim + HyDE hypothetical passage)
+      - sub_only: 1 + N queries (claim + 1-3 sub-claims)
+      - full: 1 + 1 + N queries (claim + HyDE + sub-claims)
+
+    All four configs run through retrieve_multi_query with RRF fusion.
+    """
+    cache = _load_llm_rewrites()
+    missing = [cid for cid in gold if cid not in cache]
+    if missing:
+        print(f"  WARN: {len(missing)}/{len(gold)} claims missing from rewrite "
+              f"cache; they will fall back to claim-only. Run "
+              f"`scripts.rewrite_queries` to fill.")
+
+    rows = []
+    configs = [
+        ("baseline (claim only)", False, False),
+        ("HyDE only", True, False),
+        ("sub-claims only", False, True),
+        ("HyDE + sub-claims", True, True),
+    ]
+    for label, use_hyde, use_sub in configs:
+        print(f"  [llm_rewrite] {label}...")
+        per_claim: list[dict[int, float]] = []
+        gold_sizes: list[int] = []
+        hits_at_k: dict[int, int] = {k: 0 for k in K_GRID}
+        per_label_macro: dict[str, dict[int, list[float]]] = {
+            l: {k: [] for k in K_GRID} for l in LABELS
+        }
+        n_skipped = 0
+        t0 = time.time()
+        items = list(gold.items())
+        for i, (cid, g) in enumerate(items):
+            gold_ev = set(g.get("evidences") or [])
+            if not gold_ev:
+                n_skipped += 1
+                continue
+            queries = [g["claim_text"]]
+            rec = cache.get(cid)
+            if rec:
+                if use_hyde and rec.get("hyde"):
+                    queries.append(rec["hyde"])
+                if use_sub and rec.get("sub_claims"):
+                    queries.extend(s for s in rec["sub_claims"] if s and s != g["claim_text"])
+            ids = _retrieve_multi_query(
+                g["claim_text"], queries, bm25, dense, reranker, evidence,
+                final_k=100, use_rerank=use_rerank,
+            )
+            rec_at_k = _recall_at_k_list(ids, gold_ev, K_GRID)
+            per_claim.append(rec_at_k)
+            gold_sizes.append(len(gold_ev))
+            for k in K_GRID:
+                hits_at_k[k] += len(set(ids[:k]) & gold_ev)
+            for k in K_GRID:
+                per_label_macro[g["claim_label"]][k].append(rec_at_k[k])
+            if (i + 1) % 20 == 0:
+                eta = (time.time() - t0) * (len(items) - i - 1) / (i + 1)
+                print(f"    llm_rewrite[{label}]  {i+1}/{len(items)}  ETA {eta:.0f}s")
+
+        agg = _aggregate_recall(per_claim, gold_sizes, hits_at_k, K_GRID)
+        per_label_summary = {
+            l: {k: (sum(v) / len(v)) if v else 0.0 for k, v in d.items()}
+            for l, d in per_label_macro.items()
+        }
+        for k in K_GRID:
+            m = agg[k]
+            rows.append({
+                "config": f"{label}, final_k={k}",
+                "k": k,
+                "macro": m["macro"], "micro": m["micro"],
+                "per_label_at_k": {l: per_label_summary[l][k] for l in LABELS},
+                "n": len(per_claim), "elapsed": time.time() - t0,
+            })
+    return rows
+
+
 # -- Reporting -------------------------------------------------------------
 
 def _render_table(rows: list[dict], *, k_focus: int = 5) -> str:
@@ -521,6 +625,7 @@ MODE_RUNNERS = {
     "retriever": run_mode_retriever,
     "fusion_w": run_mode_fusion_w,
     "synonym_expand": run_mode_synonym_expand,
+    "llm_rewrite": run_mode_llm_rewrite,
 }
 
 
