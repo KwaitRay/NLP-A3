@@ -2,6 +2,106 @@
 
 > Live status tracker. Update when crossing milestones. Plan in `~/.claude/plans/fancy-mapping-lemur.md`.
 
+## 2026-05-13 — Session 15 (Phase 3.5b retrieval audit + HyDE + pad-alignment pivot)
+
+Three concrete wins + one negative result + one new strategic pivot.
+The retrieval-first strategy (D-019) ran its course; we now know exactly
+where the retrieval ceiling is and have moved on to fixing training data
+alignment.
+
+### Win 1 — no-rerank Track 2 baseline lifted +0.030 HM
+
+After locking `RetrievalConfig.use_rerank=False` (Phase 3.5b mode=retriever
+audit, debug_log 复用经验 35), reran Track 2 v1:
+
+  - F:  0.135 → **0.151**  (+0.016)
+  - Acc: 0.397 → 0.364     (−0.033)
+  - HM:  0.201 → **0.213**  (+0.012, +0.030 over original k=5 baseline)
+  - predicted NEI: 2.5% → 1.7% (slightly less NEI)
+  - non-NEI acc: 0.580 → 0.531
+
+Trade-off: F gains more than Acc loses because removing the (negative-
+contribution) reranker improves recall at the cost of slightly noisier
+top-20 ordering, which the LM has to disentangle. Net HM positive.
+
+### Win 2 — Phase 3.5b LLM rewrite cache built
+
+`scripts.rewrite_queries --splits diag_test` produced 121 cached
+{claim, HyDE, sub_claims} records in ~24 min on 4080 SUPER. Sample
+inspection shows HyDE introduces domain-specific keywords absent from
+the original claim (e.g. "Eocene", "Holocene", "pre-industrial baseline
+of 280 ppm" for a stomata/ice-core CO2 claim). Quality good enough to
+proceed to retrieval audit.
+
+### Negative result — HyDE/sub-claims don't help in SFT context
+
+`scripts.retrieval_ceiling --mode llm_rewrite --no-rerank` four-way
+audit (baseline / HyDE only / sub-claims only / HyDE+sub-claims):
+
+  recall@k          k=5    k=10   k=20   k=50   k=100
+  ----------------  -----  -----  -----  -----  -----
+  baseline          0.201  0.300  0.357  0.467  0.558
+  HyDE only         0.164  0.270  0.357  0.506  0.602
+  sub-claims only   0.151  0.224  0.331  0.479  0.583
+  HyDE + sub-claims 0.193  0.248  0.339  0.511  0.616
+
+**recall@20 (SFT context length) ceiling is locked at 0.357**. HyDE +
+sub-claims actively HURT top-20 (0.339), only winning at k=50/100 with
++0.044 / +0.058 over baseline. This differs from MS MARCO/NQ HyDE
+literature (which reports top-5 gains) — explained by domain shift +
+already-saturated fused-no-rerank top-5 (which can't be improved).
+
+debug_log 复用经验 36 captures: HyDE's marginal benefit is in long-tail
+recall, not top-k where SFT lives; for in-context RAG, plain fused
+beats multi-query.
+
+### Strategic pivot — pad_with_random=False (D-019 副推论)
+
+Retrieval-side is now exhausted (rerank, fusion_w, synonym, HyDE all
+tried). The recall@20 = 0.357 IS the ceiling.
+
+But the SFT-collapse hypothesis (复用经验 34) says the model shortcuts
+"high-noise input → output NEI" because training has ~96% noise per
+non-NEI sample (1-5 gold + 15-19 random pad) while inference has ~67%
+noise. The two distributions overlap, letting the model use noise ratio
+as a label proxy.
+
+Fix: `src/build_stage0.py` train kwargs `pad_with_random: True → False`.
+Now non-NEI training samples contain ONLY the 1-5 real gold ev with
+zero random padding. Model is forced to learn semantic discrimination,
+not noise-ratio shortcuts. Local rebuild verified:
+
+  Records: 1567 (unchanged)
+  Label distribution: identical to v3-rebalanced (sanity OK)
+  n_shown was 100% at 20, now spreads:
+    1: 14.0%, 2: 18.4%, 3: 13.6%, 4: 9.1%, 5: 44.9%  (NEI=5 gold)
+
+### Next session
+
+Run on AutoDL:
+
+    python -m src.build_stage0 --force         # rebuild v2 with pad=False
+    python -m scripts.run_sft 2>&1 | tee ...   # ~1.5h SFT v6
+    swift export --adapters .../checkpoint-final --merge_lora true \\
+        --output_dir .../merged_v6
+    python -m scripts.phase1_eval --tracks 2,3 --prompts v1 \\
+        --dataset diag_test --sft-merged-dir .../merged_v6
+    python -m scripts.diagnose_phase1 --dataset diag_test
+
+Track 3 v6 target: HM > 0.213 (current Track 2 baseline). If still
+collapses, retrieval + alignment both exhausted → accept Track 2 v1
+HM 0.213 as final submission. Three-failure-story ACL report:
+
+  1. prompt engineering can't teach base what it doesn't know
+     (复用经验 21)
+  2. retrieval ceiling caps F-score under any rerank/fusion/HyDE config
+     (复用经验 22, 35, 36)
+  3. SFT collapses on train/inference distribution mismatch despite
+     class rebalance (复用经验 32, 34) — pad alignment is the last
+     attempted fix
+
+That spine is publishable per README §307 regardless of v6 outcome.
+
 ## 2026-05-12 PM — Session 14 (SFT v3-rebalanced also collapses → retrieval-first pivot)
 
 The rebalanced SFT data didn't fix anything. After v2-cut-1 (NEI 79% →

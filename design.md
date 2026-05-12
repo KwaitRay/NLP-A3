@@ -1109,6 +1109,45 @@ outputs/eval_compare.md          # markdown 对比表带 Δ 列
 +0.02 HM 预期改进。但 recall@20 还只 0.360 < 0.50 目标 → 仍需要 LLM
 rewrite (HyDE + sub-claim) 进一步提升。
 
+**D-019 进展 (2026-05-13 AM)**：retrieval-side 全部尝试完毕，**ceiling
+锁定在 recall@20 = 0.357**：
+
+- no-rerank Track 2 实测：HM 0.201 → **0.213**（+0.030 over original k=5；
+  Win 1 兑现）
+- `scripts.retrieval_ceiling --mode llm_rewrite --no-rerank` 四档对比：
+  - baseline (claim only) recall@20 = 0.357
+  - HyDE only = 0.357（持平）
+  - sub-claims only = 0.331（退步）
+  - HyDE + sub-claims = 0.339（退步）
+  - **recall@50/100 上 HyDE+sub 反超 +0.044 / +0.058**，但 SFT 用 final_k=20
+    取不到这部分增益
+- HyDE 在 climate domain 上贡献在 long-tail recall，不在 top-k precision
+  （跟 MS MARCO 文献相反，原因是 domain shift + fused-no-rerank baseline
+  已饱和 top-5）。详见 debug_log 复用经验 36。
+
+**战略转向 retrieval-first → data-format-second（D-019 副推论现已主推论化）**：
+
+retrieval ceiling 触底后，回到 `src/build_stage0.py` 改 train kwargs
+`pad_with_random=True → False`：
+
+- 旧：非 NEI 样本 1-5 gold + 15-19 random ev (~96% noise/sample)
+- 新：非 NEI 样本仅 1-5 gold ev (0% noise)，**移除"noise → NEI"shortcut**
+
+本地实测 n_shown 分布从 100% @ 20 → 1: 14% / 2: 18% / 3: 14% / 4: 9% /
+5: 45%（NEI claims 自带 5 gold off-topic，比例最大）。Label 分布完全不变
+（pad 不动 label）。
+
+**等待 SFT v6 AutoDL 实测结果**：
+
+| Track 3 v6 结果 | 含义 | 行动 |
+|---|---|---|
+| HM > 0.213 + non-NEI acc ≥ 0.45 | alignment fix 真救了 SFT | 进 DPO + Track 4 |
+| HM 0.18-0.21 (持平 baseline) | 部分救场，提升不显著 | 可选进 DPO 看 +0.02 |
+| HM < 0.16 (仍塌) | retrieval + alignment 都试过了，**真天花板** | **接受 Track 2 v1 HM 0.213 作 final** |
+
+无论结果如何，**3 个 failure story 已经构成 ACL Results 章节主线**：
+prompt → retrieval → SFT alignment。报告 publishable 无悬念。
+
 ---
 
 ## 18. 术语表

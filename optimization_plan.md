@@ -691,32 +691,43 @@ print(f'mmap load: {(mem_after - mem_before):.2f} GB resident')
       SFT 训完直接 `python -m scripts.phase1_eval --tracks 2,3 --sft-adapter ...`
       端到端拿到 Track 2 vs 3 对比。
 
-### 进行中 / In progress
-- [ ] **Phase 3.5b 检索深度审计**（design D-019 战略转向后的首要任务）：
-      SFT v2/v3 两次塌缩定位根因 = retrieval recall ceiling（debug_log 复用
-      经验 34）。跑 `scripts.retrieval_ceiling --mode retriever,fusion_w,
-      synonym_expand`（剩余 3 mode，~45 min），看 recall@20 能否 ≥ 0.50；
-      不行就上 LLM-rewrite (HyDE / sub-claim)。
-      *Phase 3.5b retrieval audit: run 3 remaining modes; goal recall@20
-      ≥ 0.50; escalate to LLM-rewrite if not.*
+### 已完成（2026-05-13 早段）/ Done
+- [x] **Phase 3.5b 检索深度审计完成**：4 个 mode (retriever / fusion_w /
+      synonym_expand / llm_rewrite) 全部跑完。**关键发现**：
+      - bge-reranker-base 在 climate 域是负贡献（×1.68 worse on recall@5）
+        → 锁 `use_rerank=False`，免费 +0.030 HM
+      - HyDE + sub-claims recall@20 = 0.339 < baseline 0.357，但
+        recall@50/100 +0.044/+0.058
+      - **recall@20 锁死在 0.357**，retrieval-side 路全堵
+- [x] **战术转向 data-format**：D-019 副推论 `pad_with_random=False`
+      改 `src/build_stage0.py`；本地 rebuild 验证 n_shown 从全 20 →
+      1-5 ev 分布；label 分布不变。详见 debug_log 复用经验 36。
+- [x] **Track 2 v1 baseline 升级到 HM 0.213**（no-rerank 实测）
 
 ### 已完成 + 留档作为 ablation / Done as ablation evidence
-- [x] **SFT v2-cut-1 + v3-rebalanced 都失败**（2026-05-12 PM）：两次 Track 3
-      HM ≈ 0.140 < Track 2 baseline 0.201。**报告 Results 章节**会用这两次
-      失败 + retrieval-first 转向作为 narrative 主线（debug_log 复用经验
-      32 / 34，design D-018 / D-019）。
-      *Two SFT failures are kept as ablation; report Results section will
-      narrate the failure → retrieval-first pivot as the key insight.*
+- [x] **SFT v2-cut-1 + v3-rebalanced 两次失败**：HM ≈ 0.140 < Track 2
+      baseline 0.213。报告 Results 章节用这两次 + retrieval audit + pad
+      pivot 作 narrative 主线（README §307 "insight into why method
+      fails"）。debug_log 复用经验 32 / 34 / 36 三连。
 
-### 待做 / Todo
-- [ ] **基于检索审计结果决策**：(A) 锁新 RetrievalConfig 重建 SFT 数据 或
-      (B) 实现 `scripts.rewrite_queries.py` 跑 HyDE + sub-claim
-- [ ] **SFT v4 重训**（retrieval 改进后）：必要时改 `pad_with_random=False`
-      避免训练 noise；目标 Track 3 HM ≥ 0.28
-- [ ] DPO 训练（dev_holdout 错样本 + `synthesise_disputed_contrast`，
-      代码在 `src/dpo_pairs.py` 已写好）
-- [ ] Phase 5 4-track 完整对比 + 锁定 production 模型
-- [ ] Phase 6：official dev 终评 + test 集预测 + 报告
+### 进行中 / In progress
+- [ ] **SFT v6 重训（pad_with_random=False）**：AutoDL 上 `git pull` +
+      `build_stage0 --force` + `run_sft.py`（~1.5h）→ `swift export
+      --merge_lora` → `phase1_eval --tracks 2,3 --sft-merged-dir
+      merged_v6` → diagnose。这是 SFT 救场的最后一次机会。
+      *SFT v6 retrain with pad-alignment fix — final shot at making SFT
+      beat Track 2 baseline.*
+
+### 待做 / Todo（取决于 v6 结果）
+- [ ] **v6 HM > 0.213** → DPO 训练（dev_holdout 错样本 + DISPUTED 对抗对）
+      → Track 4 SC 评估 → 4-track 完整对比 → Phase 6 official_dev 终评
+- [ ] **v6 HM ≤ 0.213** → **接受 Track 2 v1 (HM 0.213) 作 final 提交**，
+      SFT 全留 ablation；直接进 Phase 6（test 集预测用 Track 2 配置）
+- [ ] **Phase 6 二选一**：
+      - SFT 路径成功：sft-merged-v6 / 或 + DPO 跑 official_dev + test
+      - SFT 失败：Track 2 v1 配置（fused no-rerank, final_k=20, no SFT）跑
+- [ ] **报告 LATEX 撰写**（design.md §11.3 列了 6-9 张图表 + 3 failure
+      story narrative 已就绪）
 
 ---
 
