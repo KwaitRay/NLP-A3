@@ -692,15 +692,27 @@ print(f'mmap load: {(mem_after - mem_before):.2f} GB resident')
       端到端拿到 Track 2 vs 3 对比。
 
 ### 进行中 / In progress
-- [ ] **等 SFT 训练完成**（~30-45 min 剩余，2026-05-12 ~08:00 UTC 预计）：
-      `outputs/sft-out/v4-20260512-040505/checkpoint-final/` 落盘后立刻跑
-      Track 2 vs 3 head-to-head。
+- [ ] **Phase 3.5b 检索深度审计**（design D-019 战略转向后的首要任务）：
+      SFT v2/v3 两次塌缩定位根因 = retrieval recall ceiling（debug_log 复用
+      经验 34）。跑 `scripts.retrieval_ceiling --mode retriever,fusion_w,
+      synonym_expand`（剩余 3 mode，~45 min），看 recall@20 能否 ≥ 0.50；
+      不行就上 LLM-rewrite (HyDE / sub-claim)。
+      *Phase 3.5b retrieval audit: run 3 remaining modes; goal recall@20
+      ≥ 0.50; escalate to LLM-rewrite if not.*
+
+### 已完成 + 留档作为 ablation / Done as ablation evidence
+- [x] **SFT v2-cut-1 + v3-rebalanced 都失败**（2026-05-12 PM）：两次 Track 3
+      HM ≈ 0.140 < Track 2 baseline 0.201。**报告 Results 章节**会用这两次
+      失败 + retrieval-first 转向作为 narrative 主线（debug_log 复用经验
+      32 / 34，design D-018 / D-019）。
+      *Two SFT failures are kept as ablation; report Results section will
+      narrate the failure → retrieval-first pivot as the key insight.*
 
 ### 待做 / Todo
-- [ ] **Track 3 评估**（训完立刻）：`python -m scripts.phase1_eval --tracks 2,3 \
-      --prompts v1 --dataset diag_test --sft-adapter <ckpt>` + diagnose。
-      关注：NEI acc 0.025 → ≥ 0.40？non-NEI acc 0.580 → 不退 5pp 以上？
-      总 HM 0.203 → ≥ 0.28？
+- [ ] **基于检索审计结果决策**：(A) 锁新 RetrievalConfig 重建 SFT 数据 或
+      (B) 实现 `scripts.rewrite_queries.py` 跑 HyDE + sub-claim
+- [ ] **SFT v4 重训**（retrieval 改进后）：必要时改 `pad_with_random=False`
+      避免训练 noise；目标 Track 3 HM ≥ 0.28
 - [ ] DPO 训练（dev_holdout 错样本 + `synthesise_disputed_contrast`，
       代码在 `src/dpo_pairs.py` 已写好）
 - [ ] Phase 5 4-track 完整对比 + 锁定 production 模型
@@ -729,7 +741,10 @@ print(f'mmap load: {(mem_after - mem_before):.2f} GB resident')
 | 2026-05-12 | phase1_eval Track 3 wired | 新增 `--sft-adapter PATH` flag → `PeftModel.from_pretrained(base, path)` 原地包装。`--tracks 3` 强制 require adapter。Track 3 = base + SFT + RAG (k=20)，复用 ZeroShotInferer。诊断脚本 / write_summary 自动支持 track3_* 文件 prefix。 | `scripts/phase1_eval.py` |
 | 2026-05-12 PM | SFT v2 first cut **失败** (class-collapse) | merged-LoRA Track 3 数字 HM 0.140 < Track 2 baseline 0.201（−6pp）。诊断揭示：predicted NEI 占比 **92.6%**（gold 33%），NEI acc 0.975 但 non-NEI acc **0.062** —— 训练数据 79.1% NEI 让模型塌缩到 majority class。根因：`n_hard_neg=1` × `nei_underspec ×4` 双重 NEI 放大。详见 debug_log 复用经验 32。 | `outputs/eval_phase1/diagnose_diag_test.md` (track3_v1 行) |
 | 2026-05-12 PM | v2 revision (rebalanced) | `n_hard_neg: 1→0` + `nei_underspec: 4→2` + `disputed: 2→3`。重建后 NEI label 占比 79.1% → 38.7%（接近 gold 33%），总记录 4166→1567 (×2.7 缩小)。所有 ratio 在 0.63-1.89× gold 区间。`build_stage0` 加 distribution sanity check 每个 split 打印 + warn >2×/<0.5× 偏差。 | `src/build_stage0.py` + label-dist 输出 |
-| TBD | SFT v3 training done | 重训 + 重 Track 3 评估。Δ HM vs Track 2 v1 (0.201); NEI acc / non-NEI acc 期望落在 [0.40, 0.60] 区间（既不塌缩也不无效）。 | `outputs/sft-out/v5-*/checkpoint-final` + diagnose 报告 |
+| 2026-05-12 PM | SFT v3-rebalanced **也失败** | 重平衡 (NEI 79%→38.7%) 不解决问题：Track 3 HM 0.140 与 v2-cut-1 完全相同；predicted NEI 92.6% → **94.2%** 略恶化；non-NEI acc 0.062 → **0.049**。**class-imbalance 不是根因**。详见 debug_log 复用经验 34。 | `v5-20260512-180014/checkpoint-294` merged_v3 |
+| 2026-05-12 PM | 战略转向 retrieval-first | v3-rebalanced 失败定位根因为 **train-inference distribution mismatch**：`pad_with_random=True` 让训练时非 NEI 样本看起来跟低 recall RAG 输出一样（少数 gold + 多数 random ev），模型学到 "evidence 模糊 → NEI" 捷径。把 SFT 暂停，**先把 retrieval recall@20 从 0.333 拉到 ≥ 0.50** 才有意义训 SFT。design.md D-019。 | debug_log 复用经验 34 |
+| TBD | Retrieval audit done | `retrieval_ceiling --mode retriever,fusion_w,synonym_expand` 跑完决定锁哪个 config 还是要 LLM-rewrite (HyDE / sub-claim) | `outputs/eval_phase1/retrieval_ceiling_diag_test.md` (扩展) |
+| TBD | SFT v4 (post-retrieval-fix) | retrieval 锁好后重 build SFT 数据（自带新检索的 retrieved evidence）+ 重训。Δ HM target ≥ +0.05 vs Track 2 baseline 0.201 | (待跑) |
 | TBD | Phase 2 done | 锁定 prompt: v?  Track 2 HM 提升 +? | `outputs/eval_phase1/summary_diag_test.md` |
 | TBD | Phase 4 done | weak_buckets 配比: {...} → sft_train_v2.jsonl | `outputs/sft_data/sft_train_v2_meta.json` |
 | TBD | Phase 5 done | SFT/DPO HM = ?, 最弱桶提升: ... | Phase 5 eval reports |

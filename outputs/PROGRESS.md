@@ -2,6 +2,87 @@
 
 > Live status tracker. Update when crossing milestones. Plan in `~/.claude/plans/fancy-mapping-lemur.md`.
 
+## 2026-05-12 PM — Session 14 (SFT v3-rebalanced also collapses → retrieval-first pivot)
+
+The rebalanced SFT data didn't fix anything. After v2-cut-1 (NEI 79% →
+Track 3 HM 0.140) we cut NEI to 38.7% and retrained. Result: Track 3
+HM **0.140 again** (identical), predicted NEI **94.2%** (slightly worse
+than 92.6%), non-NEI acc **0.049** (worse than 0.062). The trained model
+on rebalanced data is basically the same as the broken one — class
+imbalance was not the root cause.
+
+This forced a real diagnosis. The training data v3 layout:
+
+  - 606 nei_underspec records: 5 real gold ev each, all off-topic
+  - 961 SUPPORTS/REFUTES/DISPUTED records: 1-5 real gold ev each, padded
+    to k=20 with random non-gold ev (`pad_with_random=True` in
+    build_dataset)
+  - At training time the model sees ~96% irrelevant evidence on non-NEI
+    samples too
+
+At inference time RAG returns top-20 with recall@20 = 0.333 (Phase 3.5
+audit). That's ~6.6 gold ev + 13.4 noise = ~67% noise per sample. From
+the model's perspective:
+
+  - During training, "high noise ratio" → either NEI (if all noise) or
+    non-NEI (if a few gold mixed in)
+  - During inference, RAG noise ratio ~67% is ABOVE the training non-NEI
+    threshold (non-NEI samples had 1-5 gold / 20 ≈ 5-25% gold) and
+    closer to the NEI pattern
+  - So model shortcuts: noise-heavy retrieval → output NEI
+
+**Root cause = train-inference distribution mismatch driven by retrieval
+recall ceiling**. Rebalancing NEI label proportion doesn't help because
+the input representation gap is preserved.
+
+### Strategic pivot (design D-019)
+
+SFT is paused. Phase 3.5b: optimize retrieval first.
+
+  - Current: full pipeline @ k=20 → macro recall@20 = 0.333
+  - Target: recall@20 ≥ 0.50
+  - If 3 remaining retrieval_ceiling.py modes (retriever / fusion_w /
+    synonym_expand) can reach it via parameter tuning, lock new
+    RetrievalConfig and retry SFT
+  - If not, escalate to LLM-driven query rewrite (HyDE + sub-claim
+    decomposition via base Qwen3.5-4B, ~half day to implement)
+  - After retrieval is fixed, retry SFT — possibly with
+    `pad_with_random=False` to keep training distribution clean
+
+### debug_log 复用经验 34
+
+Captures:
+  - The "rebalance doesn't help" surprise + numerical evidence
+  - The pad_with_random / RAG recall coupling theory
+  - General lesson: class balance is a diagnostic signal, not always the
+    root cause; check input representation alignment too
+  - Reusable rule: SFT on retrieved RAG context requires recall@k ≥ 0.5
+    or accept that training will collapse to majority class
+
+### v2-cut-1 + v3-rebalanced kept as ablation evidence
+
+Per README §307 ("clear insight into why the method works or fails"),
+both SFT failures are now project narrative gold:
+
+  - Story 1: prompt engineering can't teach base model what it doesn't
+    know (Phase 2, 复用经验 21)
+  - Story 2: retrieval ceiling caps F-score below 0.12 (Phase 3.5, 复用
+    经验 22)
+  - Story 3: SFT on small data + low recall = collapse to majority
+    (Phase 4 v2-cut-1 + v3-rebalanced, 复用经验 32 + 34)
+
+These three failure-then-diagnosis trails are the Soundness + Results
+maxima for the final ACL report.
+
+### Next session
+
+Run retrieval audit's 3 remaining modes. Based on whether recall@20
+reaches 0.50, decide:
+  - 9a (no LLM): lock new config, rebuild SFT data with retrieval fix +
+    `pad_with_random=False`, retry SFT
+  - 9b (LLM rewrite): implement `scripts/rewrite_queries.py`, multi-query
+    pipeline, re-audit, then 9a
+
 ## 2026-05-12 PM — Session 13 (SFT v2 first cut class-collapse + rebalance)
 
 SFT training finished overnight; Track 3 evaluation revealed catastrophic

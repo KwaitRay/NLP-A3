@@ -1045,6 +1045,63 @@ outputs/eval_compare.md          # markdown 对比表带 Δ 列
 - **复用 sanity check**：`src/build_stage0.py:_print_label_dist()` 在每个 split build 完打印 SFT vs gold 比对表 + ratio > 2× 或 < 0.5× warn。
 - **关联**：debug_log 问题 32；optimization_plan §4.4 (v2 revision)、§10 决策日志 2026-05-12 PM 两行；`src/build_stage0.py`。
 
+### D-019：retrieval-first 战略转向（2026-05-12 PM 晚，v3-rebalanced 也失败后）
+
+- **决策**：**暂停 SFT 训练迭代，先把 retrieval recall@20 从 0.333 拉到 ≥ 0.50**，然后才回头训 SFT。Phase 5 SFT 工作流的执行顺序从 "数据 → 训练 → 评估" 改为 "**检索优化 → 数据 → 训练 → 评估**"。
+
+- **触发事件**：v3-rebalanced SFT 实测 Track 3 HM **0.140**，跟 v2-cut-1 的 0.140 完全持平。把训练 NEI label 占比从 79% 砍到 38.7%（×2 大改）没改变 predicted NEI 94% 的塌缩行为，否决了"class imbalance 是根因"假设（D-018）。
+
+- **新的根因诊断**（debug_log 复用经验 34）：
+
+  ```
+  pad_with_random=True 让非 NEI 训练样本 = "1-5 条 gold + 15-19 条 random ev"
+                                       = ~75-95% 噪声 evidence
+
+  RAG @ recall@20 = 0.333 推理时 = "~6.6 条 gold + 13.4 条 noise"
+                              = ~67% 噪声 evidence
+
+  → 推理时输入分布跟训练时 NEI 样本（5 条全无关 gold）更接近，
+    跟非 NEI 训练样本（少数 gold + 多数 noise）也无法区分
+  → 模型学到捷径："noise-heavy → output NEI"
+  ```
+
+  **representation alignment 问题，不是 label distribution 问题**。改 label 占比不影响 input space 的混叠。
+
+- **被否决的替代**：
+  1. **继续调 weak_buckets**（已试两次 79% / 39%，结论：class balance lever 已经 saturated，再调没用）
+  2. **改 SFT 超参（lr / epochs / lora_rank 缩小）** —— 治标，但解决不了 representation alignment
+  3. **接受 Track 2 baseline 不做 SFT** —— v1 HM 0.201 离 Phase 5 目标 ≥ 0.28 有距离；保留 SFT 路径价值大
+
+- **新执行顺序**：
+
+  ```
+  Phase 3.5b retrieval 深度审计 (optimization_plan §3.5b)
+       ↓
+  scripts.retrieval_ceiling --mode retriever,fusion_w,synonym_expand
+       ↓
+  ┌─ recall@20 ≥ 0.50 ─→ 锁新 RetrievalConfig
+  │                        ↓
+  │                      build_stage0 --force (新 retrieval 重 build SFT data)
+  │                        ↓
+  │                      run_sft.py 重训 (~1.5h)
+  │                        ↓
+  │                      Track 3 评估
+  │
+  └─ recall@20 < 0.40 ─→ 写 scripts/rewrite_queries.py (HyDE + sub-claim)
+                          ↓
+                        RetrievalPipeline 加 multi-query
+                          ↓
+                        重 audit → 验证 recall 提升 → 同上路径
+  ```
+
+- **同时考虑 `pad_with_random=False`**（D-019 副推论）：build_dataset 训练时不用 random padding，仅用真实 gold ev。优点：训练分布更干净，模型不会学到"noise → NEI"。缺点：训练 evidence 数量 < 推理时 k=20，distribution 仍不一致但方向相反（训练少 noise，推理多 noise）。**等 retrieval 改进后再实验 toggle**，作为 Phase 5 ablation 一项。
+
+- **报告价值**（README §307 "clear insight into why method works/fails"）：
+  - 两次 SFT 失败 + retrieval-first 转向是论文 Results 章节的金牌 narrative
+  - 比"SFT improved HM by +0.08"更有 publishable insight
+  - 配合 debug_log 复用经验 22 (F-score ceiling) + 32 (class balance trap) + 34 (representation alignment) 三连
+- **关联**：debug_log 复用经验 32 + 34；optimization_plan §3.5 / §4 / §10 决策日志 "战略转向 retrieval-first" 行；`src/build_stage0.py` 待加 `pad_with_random=False` 选项。
+
 ---
 
 ## 18. 术语表

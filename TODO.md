@@ -3,7 +3,7 @@
 > 单页"明天打开就知道做什么"的快速恢复文档。
 > 完整计划见 `optimization_plan.md`，本文只列**接下来一步要做什么**。
 >
-> 最后更新: 2026-05-12 下午（SFT v2 第一次跑 class-collapse 失败，重平衡 v2 数据待重训）
+> 最后更新: 2026-05-12 晚（SFT v2/v3 两次都塌缩 → 战略转向 retrieval-first，design D-019）
 
 ---
 
@@ -123,31 +123,64 @@ ratio + warn >2×/<0.5×（如果再撞 class-collapse 不再盲跑 4h）。
 
 本地重建 v2 已验证：1567 records，NEI 占比 79.1% → 38.7%（gold 33.1%）。
 
-### 🎯 Step 7 — AutoDL 重训 SFT v3（**当前最优先**）
+### ❌ Step 7 — SFT v3-rebalanced 也失败（2026-05-12 PM 实测）
+
+v5-20260512-180014/checkpoint-294 → merge_v3 → eval：
+- predicted NEI 占比 92.6% → **94.2%**（更差）
+- non-NEI acc 0.062 → **0.049**（更差）
+- HM **0.140** = v2-cut-1（持平没救）
+
+**class imbalance 不是根因**，根因是 `pad_with_random=True` 让训练分布
+跟低 recall RAG 推理高度重合 → 模型学到"evidence 模糊 → NEI"捷径。
+看 debug_log 复用经验 34 + design.md D-019。
+
+**战略转向 retrieval-first**：先把 recall@20 从 0.333 拉到 ≥ 0.50，
+SFT 才有训练信号。
+
+### 🎯 Step 8 — Phase 3.5b 检索深度审计（**当前最优先**）
 
 ```bash
 source /etc/network_turbo
 cd ~/autodl-tmp/NLP-A3
-git pull origin main
 
-# 重 build 重平衡后的 v2 数据（覆盖之前的 broken v2）
-python -m src.build_stage0 --force
-# 应该看到 SFT data distribution 表，NEI ratio 1.17× gold (vs 旧 2.4×)
+# 跑剩下 3 个 mode（~45-50 min on 4080 SUPER）
+python -m scripts.retrieval_ceiling --dataset diag_test \
+    --mode retriever,fusion_w,synonym_expand 2>&1 | tee outputs/retrieval_audit_full.log
 
-# 重训 SFT。可以：
-# A. 在 notebook 里重跑 sec2-5-train（DATA_PATH 还是 sft_train_v2.jsonl，
-#    会用新重平衡的数据）
-# B. 终端直接跑 swift sft（确认 args 一致）
-
-# 训完（~1.5h，数据小 2.7×）merge:
-swift export --adapters /root/autodl-tmp/nlp_a3_cache/sft-out/<v5-*>/checkpoint-final \
-    --merge_lora true --output_dir /root/autodl-tmp/nlp_a3_cache/sft-out/merged_v3
+# 看产出
+cat outputs/eval_phase1/retrieval_ceiling_diag_test.md
 ```
 
-预期 Track 3：
-- NEI acc 0.40-0.60（不再 0.97 极端）
-- non-NEI acc ≥ 0.45（不再 0.06 崩盘）
-- HM ≥ 0.25
+读 "🏆 Best overall" 段 + recall@k 曲线。判定：
+
+| 情景 | 含义 | 行动 |
+|---|---|---|
+| 某配置 recall@20 ≥ 0.50 | retriever / fusion / synonym 找到了 | Step 9a：锁新 RetrievalConfig 重 build SFT 重训 |
+| recall@20 仍 < 0.40 | 检索器架构天花板 | Step 9b：上 LLM-rewrite (HyDE/sub-claim) |
+| 0.40-0.50 中间 | 部分提升 | 同时跑 Step 9a + 9b |
+
+### 🎯 Step 9a — 锁新检索配置 + 重训 SFT v4（最快路径，~3h）
+
+```bash
+# 改 src/retrieval/pipeline.py RetrievalConfig 默认值 → 锁定 Step 8 最佳
+# 改 src/build_stage0.py 考虑 pad_with_random=False（复用经验 34 lesson）
+python -m src.build_stage0 --force
+python -m scripts.run_sft 2>&1 | tee outputs/sft_v4_train.log
+# 训完 swift export + phase1_eval --tracks 2,3
+```
+
+### 🎯 Step 9b — LLM query rewrite (HyDE / sub-claim)（半天工作量）
+
+如果 Step 8 找不到能拉 recall@20 ≥ 0.50 的纯检索配置：
+
+1. 写 `scripts/rewrite_queries.py`:
+   - Load base Qwen3.5-4B
+   - 对每条 claim 跑 HyDE prompt + sub-claim decomposition
+   - 缓存到 `outputs/query_rewrite/claim_rewrites.jsonl`
+2. `RetrievalPipeline` 加 multi-query 接口（每条 claim 用 (claim, hyde_ev,
+   sub_claim_1, sub_claim_2) 各检索一次 RRF 融合）
+3. 重跑 retrieval audit 验证 recall 提升
+4. 锁配置后回到 Step 9a 重训 SFT
 
 ### 📋 Deferred — 推理 RAM 优化（Colab 兼容性）
 
@@ -156,7 +189,9 @@ swift export --adapters /root/autodl-tmp/nlp_a3_cache/sft-out/<v5-*>/checkpoint-
 精度损失）。详细审计 + 4 个优化选项 + 测试方式见 `optimization_plan.md`
 §8.1。
 
-### 🎯 Step 8 — Track 3 评估（v3 SFT 训完后）
+### ✅ Step 10 — Track 3 评估（v3 SFT 后）— 失败留档
+
+实际跑出来 HM 0.140 < Track 2 baseline，已记 ❌ Step 7。下面命令保留作 Track 3 v4 评估模板。
 
 ```bash
 # AutoDL 上
@@ -301,4 +336,4 @@ python -m scripts.build_indexes
 
 ---
 
-**下次 session 第一句话**：AutoDL 上 `git pull` + `python -m src.build_stage0 --force`（确认 NEI ratio ≈ 1.17×），然后重训 SFT（~1.5h with rebalanced 1567 records），`swift export --merge_lora true`，重跑 `phase1_eval --tracks 2,3 --sft-merged-dir <v3-merged>`。看 Track 3 predicted NEI 占比是否落到 30-50% 区间 + HM 是否 ≥ 0.25。
+**下次 session 第一句话**：AutoDL 上 `source /etc/network_turbo && git pull && python -m scripts.retrieval_ceiling --dataset diag_test --mode retriever,fusion_w,synonym_expand`（~45 min）。把 `retrieval_ceiling_diag_test.md` 的 🏆 Best Overall 段 + 各 mode recall@k 曲线表贴回来。如果 recall@20 能拉到 ≥ 0.50 → 锁配置 + 重 build SFT（Step 9a）；不行 → 上 HyDE rewrite（Step 9b）。
