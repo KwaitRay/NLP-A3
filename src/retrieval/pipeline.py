@@ -23,7 +23,15 @@ class RetrievalConfig:
     bm25_top: int = 200
     dense_top: int = 200
     fuse_top: int = 150
-    use_rerank: bool = True
+    # Phase 3.5b lock (2026-05-12 PM): use_rerank default flipped True → False.
+    # `scripts.retrieval_ceiling --mode retriever` audit on diag_test showed
+    # `fused (no rerank)` macro recall@5 = 0.2003 vs `full (fused + rerank)`
+    # = 0.1191 — bge-reranker-base actively reorders gold evidence OUT of the
+    # top-k for climate domain queries (~1.68× recall@5 hit when disabled).
+    # Beyond k=20 the rerank effect washes out (recall@50/@100 identical), so
+    # the reranker is hurting precision at small k without helping deeper.
+    # See debug_log 复用经验 35.
+    use_rerank: bool = False
     rerank_top: int = 50
     use_rule_reorder: bool = True
     rule_top: int = 20

@@ -221,7 +221,7 @@ def write_summary(results: list[dict], dataset_label: str) -> Path:
 
 # -- Pipeline init ---------------------------------------------------------
 
-def build_pipeline(evidence: dict, *, final_k: int = 20):
+def build_pipeline(evidence: dict, *, final_k: int = 20, use_rerank: bool = False):
     from src.retrieval.bm25 import BM25Retriever
     from src.retrieval.dense import DenseRetriever
     from src.retrieval.pipeline import RetrievalPipeline, RetrievalConfig
@@ -240,11 +240,16 @@ def build_pipeline(evidence: dict, *, final_k: int = 20):
     reranker = None
     if (dense_dir / "faiss.index").exists():
         dense = DenseRetriever.load(dense_dir, max_seq_length=256, fp16=True)
-        try:
-            from src.retrieval.rerank import CrossEncoderReranker
-            reranker = CrossEncoderReranker()
-        except Exception as e:
-            print(f"  WARN: reranker load failed ({type(e).__name__}: {e}); BM25+dense only")
+        if use_rerank:
+            # Phase 3.5b audit (2026-05-12 PM) showed bge-reranker-base
+            # hurts recall@5 on climate domain (-0.081, ×1.68 worse than
+            # fused alone). Default is now use_rerank=False; pass
+            # --rerank to opt back in for ablation.
+            try:
+                from src.retrieval.rerank import CrossEncoderReranker
+                reranker = CrossEncoderReranker()
+            except Exception as e:
+                print(f"  WARN: reranker load failed ({type(e).__name__}: {e}); BM25+dense only")
     else:
         print(f"  WARN: dense index missing at {dense_dir}; BM25-only RAG (degraded)")
 
@@ -254,6 +259,8 @@ def build_pipeline(evidence: dict, *, final_k: int = 20):
         use_rule_reorder=False,  # rule_reorder needs spaCy; skip in eval
         final_k=final_k,
     )
+    print(f"  pipeline: bm25={bm25 is not None} dense={dense is not None} "
+          f"rerank={reranker is not None} final_k={final_k}")
     return RetrievalPipeline(
         evidence_corpus=evidence, bm25=bm25, dense=dense, reranker=reranker, cfg=cfg,
     )
@@ -337,6 +344,12 @@ def main():
                         "§10). Use --final-k 5 to reproduce the pre-Phase-3.5 "
                         "baseline; outputs get a `_k5` filename suffix to "
                         "preserve the current production tables.")
+    p.add_argument("--rerank", action="store_true",
+                   help="Enable bge-reranker-base cross-encoder reordering. "
+                        "DEFAULT IS OFF since Phase 3.5b audit (2026-05-12 PM) "
+                        "showed it cuts recall@5 by ~×1.68 on climate domain "
+                        "(debug_log 复用经验 35). Use this flag only for "
+                        "ablation; output filenames get a `_rerank` suffix.")
     args = p.parse_args()
 
     tracks = [int(x) for x in args.tracks.split(",")]
@@ -359,9 +372,12 @@ def main():
     # Phase 3.5 lock: production final_k is 20. When --final-k differs we
     # suffix output filenames so the production tables aren't clobbered.
     # diagnose_phase1.py strips the suffix when looking up the gold split.
-    dataset_label = (
-        args.dataset if args.final_k == 20 else f"{args.dataset}_k{args.final_k}"
-    )
+    # Phase 3.5b: --rerank off by default; if user opts in, also suffix.
+    dataset_label = args.dataset
+    if args.final_k != 20:
+        dataset_label = f"{dataset_label}_k{args.final_k}"
+    if args.rerank:
+        dataset_label = f"{dataset_label}_rerank"
     print(f"=== Phase 1 eval: tracks={tracks} prompts={prompts} "
           f"dataset={args.dataset} final_k={args.final_k} ===")
     if dataset_label != args.dataset:
@@ -404,9 +420,9 @@ def main():
     if 2 in tracks or 3 in tracks:
         print("\n[3/4] loading evidence corpus + RAG pipeline...")
         evidence = load_evidence(show_progress=True)
-        pipeline = build_pipeline(evidence, final_k=args.final_k)
+        pipeline = build_pipeline(evidence, final_k=args.final_k, use_rerank=args.rerank)
         print(f"  evidence: {len(evidence):,} passages")
-        print(f"  RAG final_k = {args.final_k}")
+        print(f"  RAG final_k = {args.final_k}, rerank = {args.rerank}")
 
     print("\n[4/4] running track × prompt sweep...")
     results: list[dict] = []

@@ -1102,6 +1102,13 @@ outputs/eval_compare.md          # markdown 对比表带 Δ 列
   - 配合 debug_log 复用经验 22 (F-score ceiling) + 32 (class balance trap) + 34 (representation alignment) 三连
 - **关联**：debug_log 复用经验 32 + 34；optimization_plan §3.5 / §4 / §10 决策日志 "战略转向 retrieval-first" 行；`src/build_stage0.py` 待加 `pad_with_random=False` 选项。
 
+**D-019 进展 (2026-05-12 PM 晚)**：retrieval-first 第一步出乎意料 ——
+`scripts.retrieval_ceiling --mode retriever` 发现 **bge-reranker-base 是
+负贡献**（recall@5 0.119 with rerank vs 0.200 without，×1.68 worse）。
+锁 `RetrievalConfig.use_rerank = False`（复用经验 35）。这是免费的
++0.02 HM 预期改进。但 recall@20 还只 0.360 < 0.50 目标 → 仍需要 LLM
+rewrite (HyDE + sub-claim) 进一步提升。
+
 ---
 
 ## 18. 术语表
