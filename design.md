@@ -1009,6 +1009,42 @@ outputs/eval_compare.md          # markdown 对比表带 Δ 列
   3. 把 `nbstripout` 列为依赖而非"建议"，是因为 Session 12 这次 4-loop 死锁浪费了 30 分钟；自动化 0 维护成本，新人 onboarding 不会再撞。
 - **关联**：`requirements.txt` / `requirements-torch26.txt` / `scripts/patch_swift_fsdp2.py`；debug_log 复用经验 27-29；optimization_plan §10 决策日志 2026-05-12 "Env stack locked" 一行。
 
+### D-018：SFT 数据设计 v2 — 重平衡后定型（2026-05-12 PM，Phase 4 失败后重做）
+
+- **决策**：Phase 4 SFT 训练数据 (`outputs/sft_data/sft_train_v2.jsonl`) 锁定为 1567 条记录、NEI 占比 38.7%，由以下 `build_dataset` 配置生成：
+
+  ```python
+  # src/build_stage0.py
+  _TRAIN_WEAK_BUCKETS = {
+      ("scenario", "nei_underspec"): 2,       # real NEI 适度 oversample
+      ("scenario", "disputed_conflict"): 3,   # DISPUTED 仍弱，加强
+      ("scenario", "refutes_clear"): 2,       # 不变
+  }
+  # train kwargs: k=20, pad_with_random=True, n_hard_neg=0, apply_curriculum=True
+  ```
+
+- **失败的替代方案 v2-cut-1（已被驳回）**：
+  - 配置 `nei_underspec ×4` + `disputed_conflict ×2` + `n_hard_neg=1`
+  - 实测训练数据 79.1% NEI（远超 gold 33%）
+  - SFT 训完 Track 3 评估：HM 0.140 < Track 2 baseline 0.201（−6pp）；
+    predicted NEI 占比 92.6%，non-NEI acc 0.062 —— **majority-class collapse**
+  - 根因：`n_hard_neg=1` 在所有 claim 上加 synth NEI，weak_buckets 又把 nei_underspec ×4
+    → 双重放大，合计 NEI 来自 1212 (real ×4) + 2083 (hard-neg × scale) = 3295 / 4166 = 79%
+  - 详见 `debug_log.md` 复用经验 32
+
+- **为什么去 `n_hard_neg`**：
+  - 原意是教模型"看到 off-topic ev → NEI"（§0.5.3 hard constraint 1）
+  - 但 `nei_underspec ×2`（606 条 real）已经提供这个信号
+  - `n_hard_neg=1` 双倍 NEI 是无意识的代价，每个 real claim 强制配一个 NEI synth → 大类倾斜
+  - 等 Phase 5 / 6 评估如果显示 NEI acc 不达标，**再考虑回到 `n_hard_neg=0.5`** 之类（每两条 real 配一条 hard-neg）
+
+- **理由**：
+  1. 重建后 label distribution 各 ratio 在 [0.63×, 1.89×] gold 区间，sanity check 静默通过
+  2. 总记录 4166 → 1567 (×2.7 缩小)，训练时间 4h → ~1.5h，迭代成本降低
+  3. 失败的 v2-cut-1 在 PROGRESS Session 13 留档，避免未来重复试错
+- **复用 sanity check**：`src/build_stage0.py:_print_label_dist()` 在每个 split build 完打印 SFT vs gold 比对表 + ratio > 2× 或 < 0.5× warn。
+- **关联**：debug_log 问题 32；optimization_plan §4.4 (v2 revision)、§10 决策日志 2026-05-12 PM 两行；`src/build_stage0.py`。
+
 ---
 
 ## 18. 术语表

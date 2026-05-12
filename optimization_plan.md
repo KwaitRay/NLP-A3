@@ -70,14 +70,27 @@
 源自 §0.5.2，覆盖 §4.3 augmentation strategy / Derived from §0.5.2,
 binding on §4.3:
 
-1. **NEI 类必须 oversample**：base 模型对 NEI claim 强行裁决（4a 实测），
-   SFT 训练分布中 NEI 类需 oversample 到 ≥ 25%。已在
-   `build_dataset(n_hard_neg=1)` 通过 hard-negative 样本实现（一条真
-   样本 + 一条同 claim 配无关 evidence 重标 NEI），train 1972 = 986×2
-   恰好满足。Phase 4 弱桶扩充时若 NEI 桶仍最差，再加 `n_hard_neg=2`。
-   *NEI must be oversampled* — currently achieved via `n_hard_neg=1`
-   (986 real + 986 hard-neg = 1972), bump to `n_hard_neg=2` only if
-   the NEI bucket remains the weakest after Phase 4.
+1. **NEI 类必须 oversample —— 但要避免双重放大**（v2-revision 2026-05-12 PM）：
+   base 模型对 NEI claim 强行裁决（4a 实测），SFT 训练分布需要 NEI 信号
+   高于 gold 33%，但**不能超过 ~50%，否则模型塌缩到 majority class**
+   （debug_log 复用经验 32：v2-cut-1 NEI 79% → Track 3 HM 0.140 < Track 2
+   baseline 0.201，predicted NEI 92.6% / non-NEI acc 0.062）。
+
+   **当前锁定（v2-revision）**：
+   - `nei_underspec ×2`（real NEI 适度 oversample，606 条）
+   - `n_hard_neg=0`（**禁用 hard-neg 同义放大**：之前 `n_hard_neg=1` 在
+     每条 real claim 后加一条 synth NEI，被 weak_buckets factor 一起 scale，
+     2083 条 synth NEI 占总数 50%，主导 majority class）
+   - 实测 NEI 占比 38.7%（gold 33.1% × 1.17）
+
+   **训练前 sanity check**：`src/build_stage0.py:_print_label_dist()`
+   每个 split build 完打印 SFT vs gold ratio + warn >2× / <0.5×。
+
+   *NEI must be oversampled — but avoid double amplification*: v2-cut-1
+   used `n_hard_neg=1 + nei_underspec ×4` → 79% NEI → SFT collapsed to
+   majority class. Locked v2-revision: `nei_underspec ×2`, `n_hard_neg=0`,
+   resulting in NEI share 38.7% (1.17× gold). Build-time sanity check
+   prevents future collapses silently.
 2. **Citation 格式样本可保持稀疏**：base 模型已能严格输出
    `LABEL ##[i,j]##`（4b 实测），SFT 不需要为格式做样本增强，每条记
    录一次 demo 即够。
@@ -419,14 +432,39 @@ python -m scripts.run_dpo  # 待实现 / TBD
 
 ### 5.3 评估同样的 prompt + 训练后的模型 / Re-eval
 
+**LoRA adapter 加载坑（2026-05-12 PM 实测，debug_log 复用经验 31）**：
+
+ms-swift 训练 Qwen3.5 SFT 时使用 `Qwen3_5VLForConditionalGeneration` (VL
+wrapper)，adapter 的 `target_modules` regex 和 state_dict keys 都带
+`model.language_model.` 前缀。`phase1_eval.py:load_model_and_tokenizer` 用
+`AutoModelForCausalLM` 加载会得到 `Qwen3_5ForCausalLM`（纯 LM，结构
+`model.layers.X`），peft 注入失败 / state_dict 不匹配 → LoRA 静默不生效，
+Track 3 输出跟 Track 2 字节级相同。
+
+**正确路径：用 `swift export --merge_lora true` 把 LoRA 烤进 base，然后
+phase1_eval 用 `--sft-merged-dir` 加载合并后的模型（走标准 AutoModelForCausalLM
+路径，无 adapter）**：
+
 ```bash
-# 加 --sft-checkpoint / --dpo-checkpoint 参数到 phase1_eval（待实现）
-# Base model 由 cache-first 自动定位（models/Qwen3.5-4B/），无需 --model-dir。
+# 1. 合并 LoRA 到 base（~30s，产物 ~8 GB）
+swift export --adapters outputs/sft-out/checkpoint-final \
+    --merge_lora true --output_dir outputs/sft-out/merged
+
+# 2. eval 用 --sft-merged-dir（不是 --sft-adapter）
+#    Base model 由 cache-first 自动定位（models/Qwen3.5-4B/），无需 --model-dir。
 python -m scripts.phase1_eval \
-    --tracks 2,3,4 --prompts <locked> --dataset diag_test \
-    --sft-adapter outputs/sft-out/checkpoint-final \
-    --dpo-adapter outputs/dpo-out/checkpoint-final
+    --tracks 2,3 --prompts <locked> --dataset diag_test \
+    --sft-merged-dir outputs/sft-out/merged
+
+# 3. Track 4 (DPO) 待实现 — DPO 训练完后同样 merge_lora 再 eval
 ```
+
+**警告信号 - adapter 静默不生效**：
+- `phase1_eval` stdout 显示 `SFT adapter loaded (0.0X M LoRA params)` 或低于 1M
+- Track 3 vs Track 2 数字字节级相同（F/Acc/HM 完全一样）
+- 看到这些立刻停掉，走 `--sft-merged-dir` 路径
+
+**`--sft-adapter` flag 保留**给将来的非 VL 模型用，但 Qwen3.5 不行。
 
 ### 5.4 验证 / Validation
 
