@@ -1,14 +1,16 @@
-"""Phase 1 evaluation harness — base + RAG with prompt-variant sweep.
+"""Phase 1 evaluation harness — base / SFT × RAG / no-RAG × prompt sweep.
 
 Implements the workflow from design.md §11.1b / D-015:
-- Phase 1a: Track 1 (no-RAG, base model) — establishes parametric baseline.
-- Phase 1b: Track 2 (base + full RAG) — RAG-only contribution.
-- Across both tracks, sweep prompt variants v1..v4 from src.prompt.
+- Track 1: no-RAG, base model — parametric baseline.
+- Track 2: base + full RAG — RAG-only contribution.
+- Track 3: base + SFT adapter + full RAG — what Phase 5 SFT delivers.
+- Sweeps prompt variants v1..v4 from src.prompt across all enabled tracks.
 - Per run, compute (F, Acc, HM) overall + per-bucket diagnostic slices
   (domain × scenario × difficulty) using outputs/splits/{dataset}.jsonl
   for the bucket lookup.
 
-The main use case is "find the worst buckets so SFT data can target them".
+The main use case is "find the worst buckets so SFT data can target them",
+then compare Track 2 → Track 3 to validate the SFT data design closed the gap.
 
 Usage::
 
@@ -19,16 +21,20 @@ Usage::
     python -m scripts.phase1_eval --tracks 1,2 --prompts v1,v2,v3,v4 \\
                                   --dataset diag_test
 
-    # final report (with the locked-best prompt) on official dev — burns a
-    # "look at dev" budget, see D-006:
+    # Track 3 (SFT) vs Track 2 (base+RAG) head-to-head, locked prompt v1:
+    python -m scripts.phase1_eval --tracks 2,3 --prompts v1 --dataset diag_test \\
+        --sft-adapter /root/autodl-tmp/nlp_a3_cache/sft-out/checkpoint-final
+
+    # final report (locked-best prompt) on official dev — burns a "look at
+    # dev" budget, see D-006:
     python -m scripts.phase1_eval --tracks 1,2 --prompts v3 --dataset official_dev
 
 Output structure::
 
     outputs/eval_phase1/
-        track{N}_{prompt}_{dataset}.json   # raw predictions
+        track{N}_{prompt}_{dataset}.json   # raw predictions (N=1/2/3)
         track{N}_{prompt}_{dataset}.md     # per-bucket diagnostic table
-        summary_{dataset}.md               # cross-prompt comparison table
+        summary_{dataset}.md               # cross-(track,prompt) comparison
 
 Datasets:
     diag_test     — 121 claims from outputs/splits/diag_test.jsonl
@@ -284,20 +290,28 @@ def load_model_and_tokenizer(model_dir: str | None):
 # -- Main ------------------------------------------------------------------
 
 def main():
-    p = argparse.ArgumentParser(description="Phase 1 eval — Track 1/2 × prompt sweep")
+    p = argparse.ArgumentParser(description="Phase 1 eval — Track 1/2/3 × prompt sweep")
     p.add_argument("--tracks", default="1,2",
-                   help="Comma-separated track ids: 1 (no-RAG), 2 (RAG). Default 1,2.")
+                   help="Comma-separated track ids: "
+                        "1 (no-RAG base), 2 (RAG base), "
+                        "3 (RAG + SFT adapter, requires --sft-adapter). "
+                        "Default 1,2.")
     p.add_argument("--prompts", default="v1",
                    help=f"Comma-separated prompt versions. Available: {','.join(PROMPT_VARIANTS)}.")
     p.add_argument("--dataset", default="diag_test",
                    choices=["diag_test", "dev_holdout", "official_dev"],
                    help="Eval set. diag_test is the safe default; official_dev consumes a 'look at dev' budget.")
     p.add_argument("--model-dir", default=None,
-                   help="Local model snapshot. Omit to download from ModelScope.")
+                   help="Local base-model snapshot. Omit to download from ModelScope.")
+    p.add_argument("--sft-adapter", default=None,
+                   help="Path to a LoRA SFT adapter (e.g. "
+                        "outputs/sft-out/checkpoint-final). Required when "
+                        "--tracks includes 3; the adapter is wrapped around "
+                        "the loaded base model via peft.PeftModel.from_pretrained.")
     p.add_argument("--limit", type=int, default=None,
                    help="Cap claims for quick smoke (e.g. --limit 30).")
     p.add_argument("--final-k", type=int, default=20,
-                   help="Top-k evidences shown to the model in Track 2 RAG. "
+                   help="Top-k evidences shown to the model in Track 2/3 RAG. "
                         "Default 20 (Phase 3.5 lock, see optimization_plan.md "
                         "§10). Use --final-k 5 to reproduce the pre-Phase-3.5 "
                         "baseline; outputs get a `_k5` filename suffix to "
@@ -309,6 +323,11 @@ def main():
     for v in prompts:
         if v not in PROMPT_VARIANTS:
             raise SystemExit(f"unknown prompt version: {v}; available: {list(PROMPT_VARIANTS)}")
+    if 3 in tracks and not args.sft_adapter:
+        raise SystemExit("--tracks 3 requires --sft-adapter PATH (LoRA checkpoint dir).")
+    if args.sft_adapter and 3 not in tracks:
+        print(f"  WARN: --sft-adapter set ({args.sft_adapter}) but track 3 not "
+              f"in --tracks; adapter will load but go unused.")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     # Phase 3.5 lock: production final_k is 20. When --final-k differs we
@@ -330,11 +349,20 @@ def main():
         tag_lookup = {k: tag_lookup[k] for k in gold if k in tag_lookup}
     print(f"  {len(gold)} claims; {len(tag_lookup)} tagged")
 
-    print("\n[2/4] loading model + tokenizer...")
+    print("\n[2/4] loading base model + tokenizer...")
     model, tokenizer = load_model_and_tokenizer(args.model_dir)
 
+    sft_model = None
+    if args.sft_adapter:
+        from peft import PeftModel
+        print(f"  loading SFT LoRA adapter from {args.sft_adapter}...")
+        sft_model = PeftModel.from_pretrained(model, args.sft_adapter)
+        sft_model.eval()
+        n_train = sum(p.numel() for p in sft_model.parameters() if p.requires_grad)
+        print(f"  SFT adapter loaded ({n_train / 1e6:.1f}M LoRA params)")
+
     pipeline = None
-    if 2 in tracks:
+    if 2 in tracks or 3 in tracks:
         print("\n[3/4] loading evidence corpus + RAG pipeline...")
         evidence = load_evidence(show_progress=True)
         pipeline = build_pipeline(evidence, final_k=args.final_k)
@@ -352,6 +380,11 @@ def main():
                 preds = run_track1(model, tokenizer, gold, prompt)
             elif track == 2:
                 preds = run_track2(model, tokenizer, gold, prompt, pipeline)
+            elif track == 3:
+                # Same RAG pipeline + ZeroShotInferer as Track 2, but with the
+                # SFT-adapted model. The PeftModel wraps base in-place, so we
+                # don't need a fresh base copy.
+                preds = run_track2(sft_model, tokenizer, gold, prompt, pipeline)
             else:
                 raise SystemExit(f"unknown track: {track}")
             elapsed = time.time() - t0
