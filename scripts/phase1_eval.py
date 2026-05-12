@@ -21,9 +21,15 @@ Usage::
     python -m scripts.phase1_eval --tracks 1,2 --prompts v1,v2,v3,v4 \\
                                   --dataset diag_test
 
-    # Track 3 (SFT) vs Track 2 (base+RAG) head-to-head, locked prompt v1:
+    # Track 3 (SFT) vs Track 2 (base+RAG) head-to-head, locked prompt v1.
+    # For Qwen3.5 + ms-swift, the LoRA adapter target_modules + state_dict
+    # are baked against the VL wrapper but AutoModelForCausalLM strips it,
+    # so peft can't reattach. Merge LoRA into base first via swift export:
+    #     swift export --adapters /path/to/sft-out/checkpoint-final \\
+    #         --merge_lora true --output_dir /path/to/sft-merged
+    # Then point phase1_eval at the merged base:
     python -m scripts.phase1_eval --tracks 2,3 --prompts v1 --dataset diag_test \\
-        --sft-adapter /root/autodl-tmp/nlp_a3_cache/sft-out/checkpoint-final
+        --sft-merged-dir /path/to/sft-merged
 
     # final report (locked-best prompt) on official dev — burns a "look at
     # dev" budget, see D-006:
@@ -255,7 +261,7 @@ def build_pipeline(evidence: dict, *, final_k: int = 20):
 
 def load_model_and_tokenizer(model_dir: str | None):
     import torch
-    from transformers import AutoTokenizer, BitsAndBytesConfig
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
     if model_dir is None:
         # 1. Prefer pre-downloaded local copy under models/Qwen3.5-4B/
         #    (via scripts.download_models)
@@ -279,36 +285,17 @@ def load_model_and_tokenizer(model_dir: str | None):
         bnb_4bit_compute_dtype=compute_dtype, bnb_4bit_use_double_quant=True,
     )
     tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
-
-    # Qwen3.5 is a thinking-VL model. AutoModelForCausalLM resolves to
-    # Qwen3_5ForCausalLM (pure-LM, structure `model.layers.X`), but ms-swift
-    # trains the SFT adapter against Qwen3_5VLForConditionalGeneration
-    # (structure `model.language_model.layers.X` — extra wrapper). When we
-    # try `PeftModel.from_pretrained(base, sft_adapter)` against the pure-LM
-    # variant, target_modules regex fails to match AND the adapter state-dict
-    # keys carry `language_model.` which never aligns at load time → silent
-    # LoRA-not-applied. AutoModelForImageTextToText (transformers 5.x) loads
-    # the full VL wrapper so both regex and state-dict keys line up.
-    #
-    # Cost: +visual encoder weights in 4-bit (~few hundred MB extra VRAM),
-    # but no compute cost during text-only inference (visual branch never
-    # invoked). On 4080 SUPER with 31.5 GB this is negligible.
-    try:
-        from transformers import AutoModelForImageTextToText
-        model = AutoModelForImageTextToText.from_pretrained(
-            model_dir, quantization_config=bnb_cfg, device_map="auto",
-            trust_remote_code=True, torch_dtype=compute_dtype,
-        )
-        print(f"  loaded as {type(model).__name__} (VL wrapper preserved)")
-    except (ImportError, ValueError) as e:
-        # Fallback for older transformers / non-VL checkpoints.
-        from transformers import AutoModelForCausalLM
-        print(f"  AutoModelForImageTextToText unavailable ({e!r}); "
-              f"falling back to AutoModelForCausalLM")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir, quantization_config=bnb_cfg, device_map="auto",
-            trust_remote_code=True, torch_dtype=compute_dtype,
-        )
+    # AutoModelForCausalLM resolves Qwen3.5-4B to Qwen3_5ForCausalLM
+    # (text-only, structure model.layers.X). We tried AutoModelForImageTextToText
+    # to preserve the VL wrapper for adapter compat, but it (a) broke Track 2
+    # baseline (HM 0.203 → 0.133, 3x slowdown) and (b) still didn't load the
+    # adapter properly (0.0M params). The right fix is to *merge* the LoRA into
+    # the base via `swift export --merge_lora true` and load the merged dir as
+    # a normal base model via --model-dir. See debug_log 复用经验 31.
+    model = AutoModelForCausalLM.from_pretrained(
+        model_dir, quantization_config=bnb_cfg, device_map="auto",
+        trust_remote_code=True, torch_dtype=compute_dtype,
+    )
     model.eval()
     return model, tokenizer
 
@@ -330,10 +317,18 @@ def main():
     p.add_argument("--model-dir", default=None,
                    help="Local base-model snapshot. Omit to download from ModelScope.")
     p.add_argument("--sft-adapter", default=None,
-                   help="Path to a LoRA SFT adapter (e.g. "
-                        "outputs/sft-out/checkpoint-final). Required when "
-                        "--tracks includes 3; the adapter is wrapped around "
-                        "the loaded base model via peft.PeftModel.from_pretrained.")
+                   help="Path to a LoRA SFT adapter (e.g. outputs/sft-out/"
+                        "checkpoint-final). Wraps the base model via "
+                        "peft.PeftModel.from_pretrained. ⚠️ For ms-swift "
+                        "trained adapters on Qwen3.5 (VL wrapper) this path "
+                        "currently breaks — use --sft-merged-dir instead "
+                        "(see debug_log 复用经验 31). Kept for non-VL models.")
+    p.add_argument("--sft-merged-dir", default=None,
+                   help="Path to a swift-merged SFT base model (output of "
+                        "`swift export --adapters <lora> --merge_lora true "
+                        "--output_dir <merged>`). Loaded as a regular base "
+                        "model — no peft / adapter type mismatch. Recommended "
+                        "path for Qwen3.5 + ms-swift SFT.")
     p.add_argument("--limit", type=int, default=None,
                    help="Cap claims for quick smoke (e.g. --limit 30).")
     p.add_argument("--final-k", type=int, default=20,
@@ -349,11 +344,16 @@ def main():
     for v in prompts:
         if v not in PROMPT_VARIANTS:
             raise SystemExit(f"unknown prompt version: {v}; available: {list(PROMPT_VARIANTS)}")
-    if 3 in tracks and not args.sft_adapter:
-        raise SystemExit("--tracks 3 requires --sft-adapter PATH (LoRA checkpoint dir).")
-    if args.sft_adapter and 3 not in tracks:
-        print(f"  WARN: --sft-adapter set ({args.sft_adapter}) but track 3 not "
-              f"in --tracks; adapter will load but go unused.")
+    if 3 in tracks and not (args.sft_adapter or args.sft_merged_dir):
+        raise SystemExit(
+            "--tracks 3 requires --sft-adapter PATH (LoRA dir) or "
+            "--sft-merged-dir PATH (swift-merged base dir).")
+    if args.sft_adapter and args.sft_merged_dir:
+        raise SystemExit(
+            "--sft-adapter and --sft-merged-dir are mutually exclusive; pick one.")
+    if (args.sft_adapter or args.sft_merged_dir) and 3 not in tracks:
+        print(f"  WARN: SFT model path set but track 3 not in --tracks; "
+              f"SFT model will load but go unused.")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     # Phase 3.5 lock: production final_k is 20. When --final-k differs we
@@ -384,8 +384,21 @@ def main():
         print(f"  loading SFT LoRA adapter from {args.sft_adapter}...")
         sft_model = PeftModel.from_pretrained(model, args.sft_adapter)
         sft_model.eval()
-        n_train = sum(p.numel() for p in sft_model.parameters() if p.requires_grad)
-        print(f"  SFT adapter loaded ({n_train / 1e6:.1f}M LoRA params)")
+        # Count actual LoRA params (regardless of requires_grad — peft sets
+        # it to False at eval-time load, so the "trainable" count is 0 even
+        # when LoRA is correctly applied).
+        n_lora_params = sum(
+            p.numel() for n, p in sft_model.named_parameters() if "lora_" in n
+        )
+        print(f"  SFT adapter loaded ({n_lora_params / 1e6:.2f}M LoRA params).")
+        if n_lora_params < 1e6:
+            print(f"  ⚠️ LoRA params suspiciously low — see debug_log 复用经验 31. "
+                  f"If Track 3 numbers match Track 2 exactly, the adapter "
+                  f"isn't applied. Try --sft-merged-dir instead.")
+    elif args.sft_merged_dir:
+        print(f"\n[2b/4] loading SFT-merged base from {args.sft_merged_dir}...")
+        sft_model, _ = load_model_and_tokenizer(args.sft_merged_dir)
+        print(f"  SFT-merged base loaded as {type(sft_model).__name__}.")
 
     pipeline = None
     if 2 in tracks or 3 in tracks:

@@ -1405,6 +1405,66 @@ nbstripout --install   # 装到 .git/config 的 filter
 3. **grad_norm 是 loss 的搭档指标**：维持 < 5 + 不发散即可；忽然 → 0 是 LoRA 已收敛或学不动，忽然 → 100 是数值不稳。
 4. 别把 loss 和 perplexity 混淆。SFT loss = per-token CE on UNMASKED tokens；perplexity 要 exp(loss)，但 masking 让 perplexity 也失真。
 
+### 31. ms-swift VL adapter 加载到 AutoModelForCausalLM 失败 — 走 `swift export --merge_lora` 而不是 peft
+
+**症状**（2026-05-12 SFT 训完跑 Track 3 evaluation 时）：
+
+第一次报错：
+
+```
+ValueError: Target modules ^(model\.language_model(?=\.).*\.(gate_proj|in_proj_qkv|
+  o_proj|in_proj_b|up_proj|q_proj|down_proj|k_proj|in_proj_z|in_proj_a|
+  v_proj|out_proj))$ not found in the base model.
+```
+
+试换 `AutoModelForImageTextToText` 加载 VL wrapper，没报错但：
+
+- adapter 装上后 LoRA params 显示 `0.0M`（实际 0 也可能是 < 1M）
+- Track 3 输出跟 Track 2 字节级相同（HM/F/Acc 完全一样 → LoRA 没生效）
+- **Track 2 baseline 还掉了**：HM 0.203 → 0.133，速度从 1.6 s/it → 5.4 s/it
+
+**根因**：
+
+| 组件 | ms-swift 训练时 | 我们的 phase1_eval 加载时 |
+|---|---|---|
+| 模型类 | `Qwen3_5VLForConditionalGeneration`（VL wrapper） | `Qwen3_5ForCausalLM`（纯 LM）|
+| 模块结构 | `model.language_model.layers.X.self_attn.q_proj` | `model.layers.X.self_attn.q_proj` |
+| adapter regex | 含 `model.language_model.` 前缀 | regex 不匹配 |
+| adapter state_dict keys | 含 `language_model.` | inject 后的 key 不含，load 失败 |
+
+ms-swift 把 Qwen3.5 当 VL 模型加载训练，target_modules regex 和 LoRA state_dict 都烤死了 `language_model.` 前缀。换 `AutoModelForImageTextToText` 加载 VL wrapper 理论上结构对了，**但 transformers 5.2 的 `Qwen3_5ForConditionalGeneration` 跟 ms-swift 训练时的 VL 类**可能不是同一个内部布局（生成路径也不同 → Track 2 速度变 3 倍慢、数字变差）。
+
+**修复 — 不修 phase1_eval 的加载路径，而是把 LoRA 合并进 base**：
+
+```bash
+# 在 AutoDL 上
+source /etc/network_turbo
+swift export \
+    --adapters /root/autodl-tmp/nlp_a3_cache/sft-out/checkpoint-final \
+    --merge_lora true \
+    --output_dir /root/autodl-tmp/nlp_a3_cache/sft-out/merged
+# 产生一个完整的 Qwen3.5-4B + SFT 权重已 baked 的 base model（~8 GB）
+
+# 然后 phase1_eval 用 --sft-merged-dir 加载它（走 AutoModelForCausalLM 普通路径）
+python -m scripts.phase1_eval --tracks 2,3 --prompts v1 --dataset diag_test \
+    --sft-merged-dir /root/autodl-tmp/nlp_a3_cache/sft-out/merged
+```
+
+**`phase1_eval.py` 改动**：
+
+- 加 `--sft-merged-dir PATH` flag，跟 `--sft-adapter` 互斥
+- Track 3 时优先用 `--sft-merged-dir`（走干净的 AutoModelForCausalLM）
+- `--sft-adapter` 保留给非 VL 模型用；遇到 < 1M LoRA params 时 warn 指向 `--sft-merged-dir`
+- 加载器**仍用 `AutoModelForCausalLM`**（不再走 AutoModelForImageTextToText，避免 Track 2 baseline 漂移）
+
+**复用要点**：
+
+1. **ms-swift 训练 + peft load 的 model class 对齐问题 90% 是底层 VL/LM wrapper 不匹配**。诊断方法：训练前后分别 print `type(model).__name__` + sample module paths，看是否一致。
+2. **不要硬凑 model class，用 merge_lora 旁路最干净**。代价是磁盘多 8 GB merged 模型，但部署 / eval 时不再担心 adapter 加载。
+3. **`PeftModel.from_pretrained` 不报错不代表 LoRA 已应用** —— peft 默认 `strict=False`，state_dict load 不上的 key 静默跳过。判定方法：
+   - 数 LoRA 参数：`sum(p.numel() for n,p in m.named_parameters() if 'lora_' in n)`，应 > 1M（典型 r=16 在 4B 上 ~32M）
+   - 跑两段输出 diff：Track 2 和 Track 3 字节级相同 → 适配器没生效
+4. **`AutoModelForImageTextToText` 改 model class 会改 generation 路径** —— Track 2 baseline 也会跟着变（实测 −7pp HM）。不要为了 adapter 兼容性牺牲 baseline。
 
 
 
