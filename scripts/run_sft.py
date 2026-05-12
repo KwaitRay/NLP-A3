@@ -191,13 +191,16 @@ def build_swift_cmd(args: argparse.Namespace, gpu_cfg: dict) -> list[str]:
         "--dataloader_num_workers", str(args.num_workers),
     ]
 
-    # Resume: explicit `--resume-from PATH` takes precedence over auto-detect.
+    # Resume: explicit `--resume-from PATH` or `--auto-resume`. Default is
+    # FRESH start — auto-resuming an old run when training data changed
+    # (e.g. pad_with_random toggled) loads a stale-LoRA + stale-optimizer
+    # state and ALSO triggers transformers CVE-2025-32434 (optimizer.pt uses
+    # torch.load which is rejected on torch < 2.6). Safer to explicitly
+    # opt into resume when you mean it.
     resume_path = None
-    if args.no_resume:
-        pass
-    elif args.resume_from:
+    if args.resume_from:
         resume_path = Path(args.resume_from)
-    else:
+    elif args.auto_resume and not args.no_resume:
         # Auto-detect: look for output_dir/last or output_dir/v*/checkpoint-*
         last_sym = output_dir / "last"
         if last_sym.exists():
@@ -264,11 +267,18 @@ def main() -> None:
 
     p.add_argument("--resume-from", default=None,
                    help="Explicit checkpoint path for --resume_from_checkpoint. "
-                        "If omitted, auto-detects the latest checkpoint under "
-                        "--output-dir/v*-*/checkpoint-*. Use --no-resume to "
-                        "force a fresh start.")
+                        "Takes precedence over --auto-resume.")
+    p.add_argument("--auto-resume", action="store_true",
+                   help="Auto-detect and resume from the latest checkpoint "
+                        "under --output-dir/v*-*/checkpoint-*. DEFAULT IS "
+                        "OFF — auto-resuming after training data changed "
+                        "(e.g. pad_with_random toggled) loads stale state "
+                        "and may trip the transformers CVE-2025-32434 "
+                        "torch.load check on optimizer.pt. Only use this "
+                        "when continuing a previously interrupted training "
+                        "on the SAME data.")
     p.add_argument("--no-resume", action="store_true",
-                   help="Force fresh start even if checkpoints exist.")
+                   help="Force fresh start; overrides --auto-resume.")
 
     p.add_argument("--dry-run", action="store_true",
                    help="Print the command and exit without launching.")
