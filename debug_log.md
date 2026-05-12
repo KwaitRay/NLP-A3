@@ -1528,5 +1528,52 @@ NEI 从 79.1% → 38.7%（接近 gold 33% + 适度 oversample）。总记录 416
 4. **重建数据后 sanity check 是必须**：让 `build_stage0` 输出"vs gold split"的对比表，每个 label 的 ratio 一眼看见。
 5. **Hard constraint 1（NEI oversample）的最低剂量**：nei_underspec ×2（real）+ disputed ×3 提供足够的"识别 off-topic ev"信号，不需要 hard_neg synth。
 
+### 33. DataLoader worker SIGABRT 中途崩 — save_steps 缩短 + num_workers=0 兜底
+
+**症状**（2026-05-12 PM SFT v5 重训）：
+
+```
+Train:  43%|████▎     | 127/294 [47:42<1:02:44, 22.54s/it]
+RuntimeError: DataLoader worker (pid 30933) is killed by signal: Aborted.
+DataLoader worker (pid(s) 30933) exited unexpectedly
+```
+
+step 127/294 跑了 47 分钟，离首个 checkpoint (step 200) 还差 73 步 → **0 ckpt 可恢复，要从头**。
+
+**诊断**（用户实测）：
+
+| 资源 | 状态 |
+|---|---|
+| 磁盘 | 39/50 GB used, 12 GB free, 78% | 紧但够（写盘需求小）|
+| RAM | 64/503 GB used, **431 GB available** | 完全不是 RAM 问题 |
+| 失败 run dir | **144 KB** | 训练时根本没写盘出大文件 |
+
+→ **不是 OOM 也不是磁盘**（OOM 会 SIGKILL 不是 SIGABRT；磁盘 12 GB 够当时写）。
+
+**SIGABRT 的常见来源**（DataLoader worker subprocess 内）：
+
+1. **Rust tokenizer fast 实现 panic** —— 单条样本里有罕见 unicode / 大 token id 会让 `tokenizers` 库内部 `assert!` 触发。`abort()` 抛 SIGABRT。
+2. **C 扩展随机崩**（bitsandbytes / liger / fla 个别 op 在某些 dtype 边界条件下）。
+3. **CUDA worker subprocess 状态污染**（DataLoader fork 时 CUDA context 有时坏，但 prefetch=2 缺省下少见）。
+
+无法事先复现 / 复盘单一原因。**做防御性配置兜底**：
+
+**修复（已落到 `notebook_autodl.ipynb` sec2-5-train，复用经验 33）**：
+
+```python
+"  --save_steps 50 --eval_steps 50 --save_total_limit 3",   # 200 → 50
+"  --dataloader_num_workers 0",                              # 新增
+```
+
+- `--save_steps 200 → 50`: 崩了最多丢 50 步 ≈ 19 min，不再丢 47 min（覆盖 step 127 的崩盘场景）。
+- `--dataloader_num_workers 0`: 强制主进程做数据加载，**消灭 worker subprocess 失败模式**。代价 ~5-10% 训练慢（小数据集场景几分钟差距）。
+
+**复用要点**：
+
+1. **SFT 训练默认 `save_steps` 不要太大**。多数 ms-swift 教程给 200/500/1000 是为大数据集做的；我们 1567 records × 3 epochs = 294 steps，`save_steps 200` 意味着前 67% 的训练没有任何安全网。**按 `save_steps ≤ total_steps / 5` 选**。
+2. **`dataloader_num_workers=0` 是稳定性保险**：小数据集 + GPU 是 bottleneck 的场景，多 worker 没明显加速但增加 transient crash 面积。Phase 5 SFT 之后再调回去（DPO / 大数据集才有必要）。
+3. **SIGABRT vs SIGKILL 区分**：SIGABRT = 内部 abort（C 代码 assert / panic），SIGKILL = OOM killer。前者改代码 / 改 worker 配置；后者降 batch size / 升 RAM。
+4. **transient crash 不一定复现**：第二次跑同样配置同样数据，大概率不崩同一个 step。所以**别试图二分定位**，先加防御性配置（save_steps 小 + 单进程）让训练能跑完。
+
 
 
