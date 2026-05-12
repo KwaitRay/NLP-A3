@@ -336,4 +336,4 @@ python -m scripts.build_indexes
 
 ---
 
-**下次 session 第一句话**：AutoDL 上 `source /etc/network_turbo && git pull && python -m scripts.retrieval_ceiling --dataset diag_test --mode retriever,fusion_w,synonym_expand`（~45 min）。把 `retrieval_ceiling_diag_test.md` 的 🏆 Best Overall 段 + 各 mode recall@k 曲线表贴回来。如果 recall@20 能拉到 ≥ 0.50 → 锁配置 + 重 build SFT（Step 9a）；不行 → 上 HyDE rewrite（Step 9b）。
+**下次 session 第一句话**：AutoDL 上 `source /etc/network_turbo && git pull && python -m src.build_stage0 --force && python -m scripts.run_sft 2>&1 | tee outputs/sft_v6_train.log`。重训 SFT v6（`pad_with_random=False`，~1.5h），训完 `swift export --merge_lora` 拿 merged_v6 → `phase1_eval --tracks 2,3 --sft-merged-dir <merged_v6>` → `diagnose_phase1`。看 Track 3 是否 HM > 0.213 (Track 2 baseline)；是 → 进 DPO；否 → 接受 Track 2 作 final report。

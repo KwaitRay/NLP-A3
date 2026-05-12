@@ -32,6 +32,32 @@ SFT model collapsed to "always predict NEI" (Track 3 NEI acc 0.97, non-NEI acc
 Target NEI share: ~40% (vs gold 33%, vs broken v2 first cut 79%). v1 (k=5)
 remains on disk for ablation; v2 first cut overwritten in place — diagnose log
 preserves the broken numbers as evidence.
+
+v2 revision-2 (2026-05-13, debug_log 复用经验 36, design D-019 副推论):
+v3-rebalanced ALSO collapsed (Track 3 HM 0.140, predicted NEI 94.2%). Class
+balance was a diagnostic signal, not the root cause. Real root cause is
+train-inference representation mismatch:
+
+    Old training:  1-5 gold ev + 15-19 random ev (~96% noise per sample)
+    Inference:     ~6.6 gold ev + ~13.4 RAG noise (~67% noise)
+    Model shortcut: "noise-heavy input → output NEI"
+
+Phase 3.5b retrieval ceiling audit closed retrieval-side options:
+  - mode=retriever: fused-no-rerank recall@20=0.357 (best)
+  - mode=llm_rewrite (HyDE+sub-claims): recall@20=0.339 (no help at k=20)
+  - HyDE only useful at recall@50/100 (+0.04-0.06), not within SFT context
+
+Fix: pad_with_random=True → False for train. Training samples now contain
+only the real retrieved ev (no random padding to k), matching inference
+distribution exactly. With pad_with_random=False:
+  - Non-NEI samples have 1-5 ev each (the gold ev only)
+  - Model learns "given 1-5 mostly-relevant ev, output label"
+  - Inference's noisier 20-ev top-k matches none of training perfectly,
+    but at least removes the "noise → NEI" shortcut
+
+Track 3 v4 target: HM > 0.213 (current Track 2 v1 baseline). If still
+collapses, retrieval ceiling is final and we accept Track 2 as the submitted
+system.
 """
 from __future__ import annotations
 
@@ -106,19 +132,26 @@ def step_sft(force: bool) -> dict[str, Path]:
         ("scenario", "refutes_clear"): 2,       # unchanged
     }
     expected = {
-        # n_hard_neg=0 below is intentional (was 1): hard-neg synth was the
-        # dominant NEI source in the broken first cut. Real nei_underspec ×2
-        # still provides ~600 "off-topic ev → NEI" examples for hard constraint 1.
+        # n_hard_neg=0 (was 1): hard-neg synth was the dominant NEI source in
+        # the broken first cut; real nei_underspec ×2 still provides ~600
+        # "off-topic ev → NEI" examples for hard constraint 1.
+        # pad_with_random=False (was True): align training input distribution
+        # with inference. v3-rebalanced with pad_with_random=True still
+        # collapsed because non-NEI training samples had ~96% noise per
+        # sample, very close to NEI training samples (100% off-topic). With
+        # pad_with_random=False, non-NEI samples contain only the 1-5 real
+        # gold ev — model learns "given relevant ev, output label" instead
+        # of "given noise, output NEI". See debug_log 复用经验 36 + D-019.
         "train": (SPLITS_DIR / "train_split.jsonl",
                   SFT_DIR / "sft_train_v2.jsonl",
-                  dict(k=20, pad_with_random=True, n_hard_neg=0,
+                  dict(k=20, pad_with_random=False, n_hard_neg=0,
                        apply_curriculum=True, weak_buckets=_TRAIN_WEAK_BUCKETS)),
         "dev_holdout": (SPLITS_DIR / "dev_holdout.jsonl",
                         SFT_DIR / "sft_dev_holdout_v2.jsonl",
-                        dict(k=20, pad_with_random=True, n_hard_neg=0, apply_curriculum=False)),
+                        dict(k=20, pad_with_random=False, n_hard_neg=0, apply_curriculum=False)),
         "diag_test": (SPLITS_DIR / "diag_test.jsonl",
                       SFT_DIR / "sft_diag_test_v2.jsonl",
-                      dict(k=20, pad_with_random=True, n_hard_neg=0, apply_curriculum=False)),
+                      dict(k=20, pad_with_random=False, n_hard_neg=0, apply_curriculum=False)),
     }
     if not force and all(_exists_and_nonempty(t) for _, t, _ in expected.values()):
         print("[skip] SFT data files exist")

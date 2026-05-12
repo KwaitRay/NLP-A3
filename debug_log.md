@@ -1685,5 +1685,75 @@ HM        0.201 → ~0.22-0.24
 3. **reranker 影响只在 small k 显著**：k 越大它的相对作用越小，因为它只重排不增删 top-N candidate set。
 4. **报告 Results 章节金牌**："Reranker hurts recall@5 by ×1.68 on climate domain — domain-specific vocabulary mismatch with bge-reranker-base's training distribution. We disable it." 这种 unexpected ablation finding 比"reranker improves F by +X"更有 publishable value（README §307）。
 
+### 36. HyDE/sub-claim multi-query 在 top-20 没用，深度 recall 有效 — Phase 3.5b llm_rewrite mode 实测
+
+**症状**（2026-05-13 Phase 3.5b LLM rewrite audit）：
+
+跑 `scripts.retrieval_ceiling --mode llm_rewrite --no-rerank` 完整 recall@k 曲线：
+
+| base config | r@5 | r@10 | r@20 ← SFT 用 | r@50 | r@100 |
+|---|---|---|---|---|---|
+| **baseline (claim only)** | **0.201** | **0.300** | **0.357** | 0.467 | 0.558 |
+| HyDE only | 0.164 | 0.270 | 0.357 | 0.506 | 0.602 |
+| sub-claims only | 0.151 | 0.224 | 0.331 | 0.479 | 0.583 |
+| **HyDE + sub-claims** | 0.193 | 0.248 | 0.339 | **0.511** | **0.616** |
+
+**关键观察**：
+
+1. **recall@20 上 HyDE+sub-claims = 0.339，baseline = 0.357**。HyDE 不能在 SFT context length 内提升 recall。
+2. **recall@50 / @100 HyDE+sub-claims +0.044 / +0.058 over baseline**。LLM rewrite 引入的 gold ev 真的存在，但排名都落在 20-100 之间。
+3. **HyDE only 在 recall@20 持平 baseline，recall@50 +0.039 over baseline** —— HyDE 是 multi-query 的主要贡献来源，sub-claim 反而单独用时退步。
+4. **sub-claims only 在所有 k 都是 4 个 config 里最差**。`parse_subclaims` 倾向于把 claim paraphrase 成几乎同义的 atomic 句，没引入新关键词。
+
+**报告价值**：经典 HyDE 文献（Gao et al. 2022, MS MARCO / NQ）讲的是"HyDE 提升 top-5"，但**我们这里 HyDE 的浅层 precision 反而下降，深层 recall 上升**。Domain shift（climate vs MS MARCO）+ retrieval system 本身 baseline 强（fused-no-rerank 已经做了 80% 的事）共同导致 HyDE 的 marginal benefit 集中在 long tail。
+
+**结论 — retrieval-first 战略转向部分失败**：
+
+- recall@20 触到 0.357 上限，**无论什么 retrieval 配置都过不去**
+- 选 final_k=50 + HyDE+sub-claims 能拿 r@50 = 0.511，但 prompt 长度翻倍 → SFT 时间 4h、VRAM 边缘、信息密度悖论加剧
+- LLM rewrite 在深度 recall 有真实贡献，**留作 Phase 6 official_dev / test 预测时的可选 inference enhancement**（推理时 retrieval 用 multi-query，SFT 训练时不用）
+
+**改换战术 — 复用经验 36（本条）的主修复路径**：保留 retrieval baseline (final_k=20, recall@20=0.357)，**改 SFT 训练数据 `pad_with_random=False`** 让训练分布跟推理一致：
+
+```python
+# src/build_stage0.py step_sft train kwargs
+dict(k=20, pad_with_random=False,    # ← True → False
+     n_hard_neg=0, apply_curriculum=True,
+     weak_buckets=_TRAIN_WEAK_BUCKETS)
+```
+
+效果（本地实测 2026-05-13）：
+
+| | 旧 (pad_with_random=True) | **新 (pad_with_random=False)** |
+|---|---|---|
+| 总记录 | 1567 | 1567 (label distribution 不变) |
+| n_shown 分布 | 全部 = 20 (强制 pad) | 1: 14% / 2: 18% / 3: 14% / 4: 9% / 5: 45% |
+| 非 NEI 样本 evidence | 1-5 gold + 15-19 random (~96% noise) | **只 1-5 gold (0% noise)** |
+| NEI 样本 evidence | 5 gold (off-topic) | 5 gold (off-topic, 不变) |
+
+**为什么这个改动可能救 SFT**（复用经验 34 的 representation alignment 视角）：
+
+旧训练时模型看到 "1-5 gold + 多 noise" → 学到 "noise 多就 NEI"。推理时 recall@20 = 0.357 → 真实 ev ≈ 67% noise → 触发 NEI shortcut。
+
+新训练时 **非 NEI 样本完全无 noise**，模型必须用语义判别 label（不能靠 noise 比例）。NEI 样本则是 5 条全 off-topic gold ev。两类语义边界拉开。
+
+**风险**：训练 vs 推理仍不完全对齐（训练 ≤ 5 ev，推理 20 ev）。如果模型只学到"1-5 ev → 走 label，更多 ev → NEI"则仍会塌（但相比旧版本 noise 比例不同，比"96% noise vs 67% noise"差别小）。
+
+**Track 3 v6 目标**（待 AutoDL 实测）：
+
+- HM > 0.213（当前 Track 2 v1 baseline，免费 +0.030 from no-rerank lock）
+- NEI acc 不再 0.97 极端，0.30-0.60 健康区间
+- non-NEI acc 不再 0.05 崩盘，≥ 0.45
+
+**如果还塌**：retrieval ceiling + SFT representation alignment 都试过了。**接受 Track 2 v1 HM 0.213 作为 final 提交**，SFT 实验全留作 ablation。报告 Results 章节按 README §307 narrative：3 个失败 story（prompt → retrieval → SFT alignment）。
+
+**复用要点**：
+
+1. **HyDE 价值在 long-tail recall，不在 top-5 precision** —— domain 偏离 MS MARCO 越远越如此
+2. **训练分布对齐 > 类平衡 > 类指令** ：复用经验 21 (prompt 无效) + 32 (class rebalance 不够) + 36 (本条：alignment 才是关键)
+3. **每次 SFT 改 padding/sampling 策略时，build_stage0 输出的 `_print_label_dist` + n_shown 分布都要看** —— label 分布同时 input 分布也要检查
+4. **试到 retrieval recall 真的不能动了，再回头改训练数据格式** —— retrieval-first → data-format-second 是合理顺序，反过来会浪费迭代
+
+
 
 
