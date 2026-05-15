@@ -1754,6 +1754,137 @@ dict(k=20, pad_with_random=False,    # ← True → False
 3. **每次 SFT 改 padding/sampling 策略时，build_stage0 输出的 `_print_label_dist` + n_shown 分布都要看** —— label 分布同时 input 分布也要检查
 4. **试到 retrieval recall 真的不能动了，再回头改训练数据格式** —— retrieval-first → data-format-second 是合理顺序，反过来会浪费迭代
 
+---
+
+## 会话元信息（会话 4）
+
+- **日期**: 2026-05-15
+- **环境**: 本地 Windows 11 + AutoDL 4080 SUPER；接 #36 之后没新跑分实验，重点切到**提交链路工程化**
+- **范围**: 写 Codabench 提交流水线（`scripts/run_inference.py`、`scripts/build_submission.py`）+ 双语文档（`BENCHMARK_SUBMISSION.md`、`AUTODL_TO_COLAB.md`）；patch `predict_all` schema；patch `notebook_autodl.ipynb` cell 3.4；同步代码到 AutoDL 时撞 nbstripout 跨机器配置不对称的坑
+
+---
+
+## 复用经验（会话 4 增量）
+
+### 37. 跨机器 git pull 报"幽灵修改"——nbstripout filter 单边装的副作用
+
+**症状**（2026-05-15 把 `42603e6 feat(submission): wire up Codabench leaderboard pipeline` 推到远端，AutoDL pull 时撞）：
+
+```
+$ git pull origin main
+error: Your local changes to the following files would be overwritten by merge:
+        notebooks/notebook_autodl.ipynb
+
+$ git status
+        modified:   notebooks/notebook_autodl.ipynb
+
+$ git diff notebooks/notebook_autodl.ipynb
+（空——一行 diff 都没有）
+
+$ git checkout HEAD -- notebooks/notebook_autodl.ipynb   # 也清不掉
+$ git status
+        modified:   notebooks/notebook_autodl.ipynb     # 还是脏
+```
+
+**根因**：`nbstripout` 在 AutoDL 上装了（来源是 #29 那次解决方案），在 Windows 上没装。跨机器 commit 出去的 .ipynb 带了 outputs/execution_count，AutoDL 的 clean filter 把它当成"脏"。
+
+| 端 | `filter.nbstripout.clean` | commit 出去的 .ipynb |
+|---|---|---|
+| Windows（提交时）| 未配置 | 带 outputs / execution_count |
+| AutoDL（pull 时）| `python -m nbstripout`（剥 outputs）| —— |
+
+AutoDL 上 `git status` 走的对比流程：
+
+```
+working tree (带 outputs，从 index 恢复出来的)
+        ↓ 通过 clean filter
+      stripped 版本
+            vs
+       index (带 outputs，因为 commit 出自没装 nbstripout 的 Windows)
+            ↓
+      两者不一致 → 报 modified
+```
+
+`git diff` 是**空的**因为它对比的是「过 clean filter 后」的两份（都被剥光了 outputs，看起来一样）。但 `git status` 用 stat + sha 校验，看到原始字节不同就报 modified。**这是 clean filter 单边覆盖的经典指纹**——和 #29 的 JupyterLab autosave 表现一样但根因完全不同。
+
+**与 #29 的区别**：
+
+| 维度 | #29 JupyterLab autosave | #37 nbstripout 单边装 |
+|---|---|---|
+| notebook 是不是有人在动 | 是（kernel 活着 + 浏览器 tab 开着）| 否（纯静态文件）|
+| `git diff` 输出 | 有真实 diff（outputs 在变）| 空 |
+| `git checkout HEAD --` 之后 | 立刻又脏（autosave 写回）| 仍然脏（但工作区没变化，是 filter 视角问题）|
+| 解法 | Shut Down notebook + reset --hard | `git checkout origin/<branch> -- file` |
+
+**当场修复**（按顺序，前两条不行才升级）：
+
+1. `git checkout HEAD -- notebooks/notebook_autodl.ipynb` ← **不行**（HEAD 版本本身带 outputs，写出来还是脏）
+2. `git checkout origin/main -- notebooks/notebook_autodl.ipynb` ← **这一条管用**：绕开本地 HEAD，直接拿远端版本写入 index + 工作区，幽灵 modified 立即消失
+3. 然后 `git pull origin main` 正常 fast-forward
+
+**长期解 — 三选一**：
+
+| 方案 | 操作 | 副作用 |
+|---|---|---|
+| A. Windows 也装 nbstripout（**推荐**）| 在本地仓库根：`pip install nbstripout && nbstripout --install` | 提交体积变小；不再触发 #37；和 AutoDL 对称 |
+| B. AutoDL 卸载 nbstripout | `nbstripout --uninstall` | notebook outputs 不再自动剥，每次 commit 都是大 diff，回到 #29 的死循环 |
+| C. 关闭这个 repo 的 filter | `git config --unset filter.nbstripout.clean && git config --unset filter.nbstripout.smudge` | 仅本仓库本机生效；切实例就要重做 |
+
+**复用要点**：
+
+1. **跨机器 git 工作流必须保证 filter 配置对称**——要么 Windows + AutoDL + Colab 都装 nbstripout，要么都不装
+2. `git diff` **空但 status 报 modified** = filter 单边的指纹，**别浪费时间反复 git checkout**，直接 `git checkout origin/<branch> -- file`
+3. `git checkout origin/<branch> -- file` 是这种场景的逃生出口，比 `git reset --hard` 安全（只动一个文件，不破坏其他工作）
+4. 装 nbstripout 后忘记 `git add --renormalize .` 一次的话，仓库里所有历史 .ipynb 第一次 status 都会一并报脏——这是正常的，renormalize 一次后就稳定
+5. **检查命令**速记：`git check-attr --all <file>` 看是不是有 filter 配置；`git config --get-all filter.nbstripout.clean` 看 clean filter 命令
+
+### 38. Codabench 提交 schema 含 `claim_text`，eval.py 不校验——本地 pass ≠ 平台 pass
+
+**触发**（2026-05-15 写 `scripts/build_submission.py` 时审查 schema 发现）：
+
+`eval.py:29-31` 校验只看 `claim_label` 和 `evidences`：
+
+```python
+if claim_id in predictions and \
+    "claim_label" in predictions[claim_id] and \
+    "evidences" in predictions[claim_id]:
+```
+
+但 `materials/scorebench/bench平台要求.docx` 给的 submission 例子带第三个字段：
+
+```json
+"claim-2967": {
+  "claim_text": "[South Australia] has the most expensive electricity in the world.",
+  "claim_label": "SUPPORTS",
+  "evidences": ["evidence-67732", "evidence-572512"]
+}
+```
+
+`claim_text` 在示例里出现 → 平台校验脚本**可能会校验它**。本地 `eval.py` 不会。
+
+**踩这个坑会怎样**：本地 dev 跑分一切正常，submission.zip 上传 Codabench → "Invalid format" / "Missing required field"，**烧掉一次 Phase 1 的 5/天配额**或者 Phase 2 的 1/3 配额（更贵）。
+
+**修复**：`src/inference.py` 的 `predict_all()` 在写盘前从输入 dict 注入 `claim_text`：
+
+```python
+ctext = claim["claim_text"]
+result = inferer.predict(ctext)
+preds[cid] = {"claim_text": ctext, **result}
+```
+
+这样**任何 inferer 的输出**都自动带 claim_text，不依赖 inferer 本身记得加。失败 fallback 路径（per-claim try/except）也照样注入。
+
+**`build_submission.py` 双保险**：即使 preds 文件没带 `claim_text`（旧 preds、手 build 的、实验脚本绕过 predict_all 的），build_submission 也会从 `data/test-claims-unlabelled.json` 重 merge 一次——而且**优先用 test 文件版本**，防止某条 preds 不小心被人手改过 claim_text。
+
+**复用要点**：
+
+1. **本地 eval 通过 ≠ 提交平台通过**——schema 校验严格度可能比本地宽松也可能严，**永远以平台示例 JSON 为准**
+2. **schema 字段宁多勿少**：能注入的必填字段在最早环节注入（predict_all），后续每一环都做双保险（build_submission re-merge）
+3. **平台示例 JSON > 平台文档**——文档可能漏字段，示例是事实标准；写 schema validator 时按示例的 keys 来，不按文档表格
+4. 本项目所有 inferer (`ModelInferer` / `ZeroShotInferer` / `RetrievalOnlyInferer` / `NoRagInferer`) 输出 dict **不需要**自己加 `claim_text`，由 `predict_all` 统一注入——如果以后加新 inferer，**别在 inferer 内部加 claim_text 字段**（重复注入）
+5. **第一次提交配额很贵**（Phase 1 是 5/天，Phase 2 是 1/3 终生），先在 dev 上跑 build_submission 走一遍打包链路（`--dry-run` 等价方式：跑 dev 但 phase 选 1，让平台拒收）→ 烧掉一次也能学到"我的链路是不是对的"
+
+
 
 
 
