@@ -281,10 +281,19 @@ def predict_all(
     import traceback as _tb
     _err_traces_shown = 0
     for cid, claim in iterator:
+        # claim_text is injected from the input (not the inferer) so the
+        # written JSON matches the Codabench submission schema, which
+        # requires every entry to carry claim_text alongside label/evidences.
+        ctext = claim["claim_text"]
         try:
-            preds[cid] = inferer.predict(claim["claim_text"])
+            result = inferer.predict(ctext)
+            preds[cid] = {"claim_text": ctext, **result}
         except Exception as e:  # robust to per-claim failures during long runs
-            preds[cid] = {"claim_label": "NOT_ENOUGH_INFO", "evidences": ["evidence-0"]}
+            preds[cid] = {
+                "claim_text": ctext,
+                "claim_label": "NOT_ENOUGH_INFO",
+                "evidences": ["evidence-0"],
+            }
             # Print full traceback for the first 3 failures so silent
             # errors (e.g. empty AttributeError) are diagnosable.
             if _err_traces_shown < 3:
