@@ -185,8 +185,15 @@ def train_one_seed(args) -> dict:
     from src.paths import resolve_model_path
     base_path = resolve_model_path(BASE_MODEL_NAME)
     tokenizer = AutoTokenizer.from_pretrained(base_path)
+    # XLM-R + LoRA + InfoNCE in pure fp16 produces NaN logits within 20
+    # steps (attention softmax overflows, classifier head saturates). bf16
+    # has fp32-equivalent dynamic range so the same recipe is stable.
+    # 4080 SUPER (Ampere+) supports bf16 natively; fall back to fp32 on
+    # pre-Ampere GPUs.
+    train_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+    print(f"  train dtype: {train_dtype}")
     model = AutoModelForSequenceClassification.from_pretrained(
-        base_path, num_labels=1, torch_dtype=torch.float16,
+        base_path, num_labels=1, dtype=train_dtype,
     )
     lora_cfg = LoraConfig(
         r=args.lora_r, lora_alpha=args.lora_alpha,
@@ -244,6 +251,16 @@ def train_one_seed(args) -> dict:
             B = labels.size(0)
             scores = logits.view(B, n_cands)
             loss = F.cross_entropy(scores, labels, label_smoothing=0.05)
+            # Hard fail on NaN — once AdamW state is poisoned by a NaN
+            # grad, the run never recovers. Faster to abort and surface
+            # the root cause (dtype/lr/data) than to chew through 3 min
+            # of zero-progress steps.
+            if not torch.isfinite(loss):
+                raise RuntimeError(
+                    f"NaN/Inf loss at step {step + 1} (batch {batch_idx}). "
+                    f"Common causes: fp16 dtype (use bf16), too-high LR, "
+                    f"or empty/bad input batch."
+                )
             (loss / args.grad_accum).backward()
 
             if (batch_idx + 1) % args.grad_accum == 0:
@@ -315,8 +332,10 @@ def merge_lora(args) -> Path:
     print(f"[merge] loading adapter from {src}")
     base_path = resolve_model_path(BASE_MODEL_NAME)
     tokenizer = AutoTokenizer.from_pretrained(base_path)
+    # bf16 to match training dtype; fall back to fp32 on pre-Ampere.
+    merge_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
     base = AutoModelForSequenceClassification.from_pretrained(
-        base_path, num_labels=1, torch_dtype=torch.float16,
+        base_path, num_labels=1, dtype=merge_dtype,
     )
     model = PeftModel.from_pretrained(base, str(src))
     merged = model.merge_and_unload()
