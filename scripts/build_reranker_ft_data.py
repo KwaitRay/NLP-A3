@@ -242,7 +242,14 @@ def main() -> int:
                    help="Source claims for training-time eval (default: diag_test.jsonl)")
     p.add_argument("--out-dir", type=Path, default=OUTPUTS_DIR / "reranker_ft_data")
     p.add_argument("--top-k", type=int, default=50,
-                   help="Top-k pool depth (matches inference rerank_top, default 50)")
+                   help="Train-side pool depth from which to draw hard negs "
+                       "(default 50, matches inference rerank_top).")
+    p.add_argument("--eval-top-k", type=int, default=None,
+                   help="Eval-side candidate pool depth. Defaults to --top-k. "
+                       "Set higher (e.g. 100) to give the reranker access to "
+                       "deeper candidates — raises the recall@k ceiling at "
+                       "eval (baseline recall@100=0.579 vs recall@50=0.485). "
+                       "Costs ~2× eval wall-time per checkpoint.")
     p.add_argument("--n-negs", type=int, default=7,
                    help="Hard negatives per training row (so list size = 1+N, default 7 → 8)")
     p.add_argument("--neg-global-cap", type=int, default=5,
@@ -288,10 +295,23 @@ def main() -> int:
         neg_global_cap=args.neg_global_cap, rng=rng,
     )
 
-    print(f"\n[4/4] building eval rows ({args.eval.name})...")
+    eval_top_k = args.eval_top_k or args.top_k
+    print(f"\n[4/4] building eval rows ({args.eval.name}, top-{eval_top_k})...")
     eval_claims = list(read_jsonl(args.eval))
+    # Eval pipeline may use a different (deeper) pool. The pipeline's
+    # `fuse_top` already accommodates `max(150, args.top_k * 2)`, but if
+    # eval_top_k > that we widen `final_k`/`fuse_top` on the fly.
+    if eval_top_k > args.top_k:
+        from dataclasses import replace as _replace
+        deep_cfg = _replace(cfg, final_k=eval_top_k,
+                            fuse_top=max(cfg.fuse_top, eval_top_k * 2))
+        eval_pipeline = RetrievalPipeline(
+            evidence_corpus=evidence, bm25=bm25, dense=dense, reranker=None, cfg=deep_cfg,
+        )
+    else:
+        eval_pipeline = pipeline
     eval_rows, eval_stats = _build_eval_rows(
-        eval_claims, evidence, pipeline, top_k=args.top_k,
+        eval_claims, evidence, eval_pipeline, top_k=eval_top_k,
     )
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -315,6 +335,7 @@ def main() -> int:
             "w_bm25": cfg.w_bm25, "w_dense": cfg.w_dense,
             "use_rerank": cfg.use_rerank, "use_rule_reorder": cfg.use_rule_reorder,
             "top_k": args.top_k,
+            "eval_top_k": eval_top_k,
         },
     }
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")

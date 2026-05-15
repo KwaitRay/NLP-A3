@@ -250,7 +250,7 @@ def train_one_seed(args) -> dict:
             logits = outputs.logits.squeeze(-1)  # [B*(1+N)]
             B = labels.size(0)
             scores = logits.view(B, n_cands)
-            loss = F.cross_entropy(scores, labels, label_smoothing=0.05)
+            loss = F.cross_entropy(scores, labels, label_smoothing=args.label_smoothing)
             # Hard fail on NaN — once AdamW state is poisoned by a NaN
             # grad, the run never recovers. Faster to abort and surface
             # the root cause (dtype/lr/data) than to chew through 3 min
@@ -370,6 +370,12 @@ def main() -> int:
     p.add_argument("--eval-batch-size", type=int, default=32)
     p.add_argument("--early-stop-patience", type=int, default=3,
                    help="number of evals without recall@20 improvement before stopping")
+    p.add_argument("--label-smoothing", type=float, default=0.05,
+                   help="label smoothing for InfoNCE. Bump to 0.10-0.15 when "
+                        "hard negs are noisy (false-neg signal — see Gate A "
+                        "diagnosis 2026-05-16: loss converges at ln(N) → "
+                        "uniform random, signal drowned by entailment-"
+                        "equivalent negs).")
     # lora
     p.add_argument("--lora-r", type=int, default=8)
     p.add_argument("--lora-alpha", type=int, default=16)
