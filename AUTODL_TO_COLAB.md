@@ -65,9 +65,9 @@
 | bge-reranker-base 权重 | `$PROJECT_ROOT/models/bge-reranker-base/` | `models/bge-reranker-base/` | 3.2 GB | 默认关闭（Phase 3.5b 审计：在气候领域伤 recall@5 ×1.68，debug_log 复用经验 35）；只在做 reranker 消融时迁 |
 | 评估报告 / eval reports | `$PROJECT_ROOT/outputs/eval_phase1/*.{json,md}` | `outputs/eval_phase1/` | < 5 MB | 想保留 ablation table 就一起带走 |
 | ablation 报告 | `$PROJECT_ROOT/outputs/ablation/`、`outputs/dry_run_report.md` | 同名 | < 1 MB | 写报告要引用历史结果时带上 |
-| 评估预测 / predictions | `$PROJECT_ROOT/outputs/predictions/*.json` | `outputs/predictions/` | < 5 MB | 历史 run 的预测；只有要复现旧 leaderboard 提交时才需要 |
-| **submission ledger** | `$PROJECT_ROOT/outputs/submissions/ledger.jsonl` | `outputs/submissions/ledger.jsonl` | < 100 KB | **如果在 AutoDL 上已经提交过 Codabench**，必须迁，否则 Colab 上的配额计数器从 0 重新算，可能误算超额 |
-| evidence-id 缓存 | `$PROJECT_ROOT/outputs/submissions/.evidence_ids.txt` | 同名 | ~17 MB | `build_submission` 用来快校验 evidence 真实性；不传第一次跑时会自动重建（耗 ~30 s 加载 evidence.json） |
+| dev/diag_test 预测 / non-test predictions | `$PROJECT_ROOT/outputs/predictions/*.json` | `outputs/predictions/` | < 5 MB | 仅 dev/diag_test inference 用（`run_inference --target dev/diag_test`）；test 预测在下面的 benchmark/ |
+| **benchmark/ 整个目录**（Codabench 提交产物） | `$PROJECT_ROOT/benchmark/` | `benchmark/` | < 50 MB | 含 `ledger.jsonl`（**必迁**，配额计数）+ `runs/<TAG>/{config.json, preds.json, submission.zip, test-output.json}` + `.evidence_ids.txt`（缓存，可重建） |
+| evidence-id 缓存（benchmark 内部） | `$PROJECT_ROOT/benchmark/.evidence_ids.txt` | 同名 | ~17 MB | 不迁的话第一次 `build_submission` 会自动重建（~30 s 加载 evidence.json） |
 
 ---
 
@@ -176,9 +176,9 @@ python -m scripts.run_inference \
     --decoding retrieval-only --limit 10
 ```
 
-**期望结果**：3-5 秒内写出 `outputs/predictions/migration_smoke__diag_test.json`，10 条预测每条带 `claim_text` + `≤5 evidence-* IDs`。如果报 `BM25 index missing` 或 `dense index missing`，说明 §6.1 的解包路径错了。
+**期望结果**：3-5 秒内写出 `outputs/predictions/migration_smoke__diag_test.json`（target=diag_test 走 outputs/predictions/，target=test 才落 benchmark/runs/），10 条预测每条带 `claim_text` + `≤5 evidence-* IDs`。如果报 `BM25 index missing` 或 `dense index missing`，说明 §6.1 的解包路径错了。
 
-**Expected**: writes `outputs/predictions/migration_smoke__diag_test.json` in 3-5 s with 10 valid predictions. Index errors here mean the §6.1 unpack paths are wrong.
+**Expected**: writes `outputs/predictions/migration_smoke__diag_test.json` in 3-5 s with 10 valid predictions (note: target=diag_test routes to outputs/predictions/; only target=test goes under benchmark/runs/). Index errors here mean the §6.1 unpack paths are wrong.
 
 ---
 
@@ -202,5 +202,5 @@ python -m scripts.run_inference \
 - [ ] AutoDL 端 `MIGRATION_MANIFEST.txt` 与 Colab 端解包后 `sha256sum -c` 全部一致
 - [ ] Colab 端 cell [9] cache audit ≥ 10/12 OK（FAISS + SFT-merged 必须 OK）
 - [ ] §7 的 retrieval-only smoke 跑通，输出 10 条合格预测
-- [ ] `outputs/submissions/ledger.jsonl` 已迁（如有过历史提交），不然 phase 配额会算错
+- [ ] `benchmark/ledger.jsonl` 已迁（如有过历史提交），不然 phase 配额会算错
 - [ ] `git pull` 拉到最新代码（`scripts/run_inference.py`、`scripts/build_submission.py`、`BENCHMARK_SUBMISSION.md` 都是 2026-05-15 加的）

@@ -768,3 +768,78 @@ outputs/
 - Confirm `Qwen/Qwen3.5-4B-Instruct` exists on ModelScope. Fallback: `Qwen/Qwen2.5-VL-3B-Instruct`.
 - Confirm ms-swift's `--model_type` slug for Qwen3.5-VL. Fallback: Unsloth.
 - Pick final retrieval weights (0.3/0.7 default) by k-sweep on dev.
+
+---
+
+## 2026-05-16 — Session 16 (Codabench 提交流水线落地 + 第一次 baseline + 战略转向 retrieval-first)
+
+承接 #36 之后，本周不再做 SFT/DPO 实验（retrieval recall ceiling 才是瓶颈，复习 #34/#36 结论）。这一会话把**提交链路工程化** + **跑出第一个 baseline 提交**。
+
+### Win 1 — Codabench 提交流水线全部落地
+
+四条新脚本 + 一个目录约定：
+
+- `scripts/run_inference.py` — 端到端推理 CLI，target ∈ {test, dev, official_dev, diag_test, dev_holdout}，decoding ∈ {self_consistency, greedy, retrieval-only}。复用 `phase1_eval.build_pipeline + load_model_and_tokenizer` 保证 cache lookup 单源。
+- `scripts/build_submission.py` — 校验 153 ids + label whitelist + evidence-id corpus 存在性 + ≤5 evidences；写 `test-output.json` + zip（arcname='test-output.json' 无目录层）+ 追加 `benchmark/ledger.jsonl`；Phase 1 (5/天, 100 总) 与 Phase 2 (3 总) 配额硬熔断。
+- `scripts/audit_cache.py` — 16 检查 / 4 tier (critical / important / helpful / report) / 3 级 exit code (0/1/2)。AutoDL `/root/autodl-tmp/nlp_a3_cache` 自动检测（不再依赖 notebook 先 `export CACHE_ROOT=...`）。
+- `scripts/profile_evidence.py` — chunking 决策前置审计，char/token 长度分布 + 内部结构（句子/段落计数）+ verdict（"chunking 不值"vs"应该试"）。**已写未跑**。
+
+新目录 `benchmark/` 在项目根，自包含每次提交：
+```
+benchmark/
+├── README.md            (双语，layout + naming + quota query + migration notes)
+├── ledger.jsonl         (跨提交配额追踪，必迁移)
+├── .evidence_ids.txt    (corpus cache，可重建)
+└── runs/<TAG>/
+    ├── config.json      (run flags + git SHA snapshot, tracked)
+    ├── preds.json       (gitignored)
+    ├── test-output.json (gitignored)
+    └── submission.zip   (gitignored)
+```
+
+### Win 2 — 第一个 baseline 提交已生成
+
+AutoDL 上跑了 `v1-base-rag-greedy`：
+
+- 配置：Qwen3.5-4B (4-bit) + BM25 + dense + greedy + prompt v1, final_k=5, no rerank, no SFT
+- 用时：362.8s for 153 claims（2.37s/claim）
+- 产物：`benchmark/runs/v1-base-rag-greedy/submission.zip` (12.5 KB)
+- ledger 第 1 行已写，`codabench_hmean=null`（待人工上传 + 回填）
+
+### 决策记录 — SFT/DPO 不做了，转 retrieval-first
+
+| 维度 | 决策 | 理由 |
+|---|---|---|
+| SFT v6（pad_with_random=False）| **不再尝试** | #34/#36 已证：noisy retrieval 下 SFT 会做 class collapse，retrieval ceiling 才是真瓶颈 |
+| DPO | **不再尝试** | 同上；且 DPO 需要先有靠谱的 SFT 基础，不存在了 |
+| chunk 切分优化 | **优先做** | 用户要先做这个；profile 脚本已写，等 verdict 决定具体 chunker |
+| reranker fine-tune | **次优先** | 用户审计观察到 "reranker 后 @50 涨 / @20 降"，是干净的 OOD reordering 信号，FT 大概率能修 |
+
+### 新增 debug_log 经验（会话 4 增量）
+
+- **#37** 跨机器 git pull "幽灵修改" — nbstripout 单边装的副作用（症状/根因/修复/与 #29 的对照表/三档长期解）
+- **#38** Codabench 提交 schema 含 `claim_text`，`eval.py` 不校验 → 本地 pass ≠ 平台 pass。`predict_all` 注入 + `build_submission` re-merge 双保险
+
+### 文档增量
+
+- `BENCHMARK_SUBMISSION.md` — 双语，平台规则 → 项目状态映射 + 校验清单 + 落地状态表
+- `AUTODL_TO_COLAB.md` — 双语，tier 分级迁移清单 + tar 打包命令 + Drive 配额预算
+- `benchmark/README.md` — layout + TAG naming + quota query 一页 cheatsheet
+
+### Memory（feedback type, 跨会话生效）
+
+- 新增 `feedback_minimize_jupyter.md` — 此项目优先 CLI 脚本，notebook 留到最终版才更新（避免再撞 nbstripout 跨机器）
+
+### 当前 commit 链
+
+- `42603e6` feat(submission): wire up Codabench leaderboard pipeline
+- `4a874a9` feat(audit): add scripts/audit_cache.py — single-source cache state CLI
+- `5ced002` refactor(submission): consolidate Codabench artifacts under benchmark/ + AutoDL auto-detect
+
+### What's blocked / pending（截至本次 session 末）
+
+- **人工动作**：把 `benchmark/runs/v1-base-rag-greedy/submission.zip` 下载 → Codabench 上传 → 拿到 H_FA → 回填 ledger 的 `codabench_hmean` 字段
+- **下一步实验**（task list 已建 #1-#5）：
+  - #1 跑 `python -m scripts.profile_evidence`（in_progress, 脚本已写）
+  - #2-#5 根据 profile verdict 选 2-3 种 chunking 策略实现 + dev 评估
+- **如果 chunking verdict = "不值"**：直接跳到 reranker fine-tune（数据准备 → bge-reranker-base LoRA → 三档对比）

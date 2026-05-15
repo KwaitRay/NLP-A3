@@ -11,6 +11,12 @@
 
 ## 0. TL;DR
 
+> **当前状态 / Current status (as of 2026-05-16)**
+> - 提交流水线**已落地**：`scripts/run_inference.py` + `scripts/build_submission.py` + `benchmark/` 自包含目录
+> - 第一个 baseline 已生成：`v1-base-rag-greedy`（Qwen3.5-4B + BM25+dense + greedy + prompt v1, final_k=5），AutoDL 上 153 条推理用时 ~6 min
+> - 提交配额追踪已上线：`benchmark/ledger.jsonl`（1/100 used）
+> - SFT/DPO **暂时跳过** —— `debug_log.md` #34/#36 已经证明 retrieval ceiling 才是瓶颈，noisy retrieval 下 SFT 反而做 class collapse。当前优化方向：retrieval-first（chunking → reranker FT）
+
 - **平台**：Codabench leaderboard，2026 学期可选项（不计入最终成绩，仅作公共对比）。
   **Platform**: Codabench leaderboard for COMP90042 2026 — *optional*, does not affect final mark, used purely as a public benchmark.
 - **关键交付物**：一个 `.zip`，里面**只放**一个 UTF-8 JSON 文件 `test-output.json`，覆盖 `data/test-claims-unlabelled.json` 的全部 **153** 条 `claim_id`。
@@ -55,8 +61,8 @@ The leaderboard's three numbers map 1-for-1 to the local `eval.py` outputs (`eva
 | Phase 1 (Ongoing) | 2026-05-01 ~ 05-18 | 5 | 100 |
 | Phase 2 (Final)   | 2026-05-19 ~ 05-22 | — | 3 |
 
-**实现建议 / Suggested**：在 `outputs/submissions/ledger.jsonl` 里每打包一次记一行（时间戳、目标 phase、git SHA、preds 文件 sha256、本地 dev H_FA），临提交前读 ledger 校验"今日还剩几次 / 本 phase 还剩几次"。
-**Suggestion**: append one row to `outputs/submissions/ledger.jsonl` per package (timestamp, target phase, git SHA, preds sha256, local dev H_FA); the build script reads the ledger and aborts if today's or the phase budget is exhausted.
+**已实现 / Implemented**：`benchmark/ledger.jsonl` 每打包一次追加一行（时间戳、目标 phase、git SHA、preds 文件 sha256、本地 dev H_FA），`build_submission.py` 读 ledger 在打包前校验"今日还剩几次 / 本 phase 还剩几次"。
+**Status**: every `build_submission` run appends one row to `benchmark/ledger.jsonl` (timestamp, target phase, git SHA, preds sha256, local dev H_FA); the script reads the ledger pre-build and aborts if today's or the phase budget is exhausted.
 
 ### 1.4 合规红线 / Compliance red lines
 
@@ -111,31 +117,36 @@ outputs/dry_run/preds.json          # 当前命名 ≠ test-output.json
 ### 3.1 端到端流水线（5 步）/ End-to-end pipeline (5 steps)
 
 ```
-Step 1: 推理 / Inference
-  python -m scripts.run_inference --target test --out outputs/predictions/test_run_<TAG>.json
-    └── 在 Colab/AutoDL 上跑 ModelInferer over test-claims-unlabelled (153 claims)
-    └── 落盘 {claim_id: {claim_label, evidences}}
+Step 1: 推理 / Inference (default --out goes to benchmark/runs/<TAG>/preds.json
+        when --target test; other targets go to outputs/predictions/)
+  python -m scripts.run_inference --target test --tag <TAG> \
+      --decoding greedy --prompt-version v1 --final-k 5
+    └── 在 AutoDL 上跑 inferer over test-claims-unlabelled (153 claims)
+    └── 落盘 benchmark/runs/<TAG>/preds.json (claim_text 已注入)
+    └── 同时落盘 benchmark/runs/<TAG>/config.json (run flags + git SHA snapshot)
 
 Step 2: 打包 / Build submission
   python -m scripts.build_submission \
-      --preds outputs/predictions/test_run_<TAG>.json \
+      --preds benchmark/runs/<TAG>/preds.json \
       --tag <TAG> --phase 1
-    └── 合并 claim_text（来自 test-claims-unlabelled.json）
+    └── 合并 claim_text（从 test-claims-unlabelled.json 重 merge，防 stale preds）
     └── 校验 153 个 claim_id 全在、label 合法、evidences 非空、evidence_id ∈ evidence.json
-    └── 写 outputs/submissions/<TAG>/test-output.json
-    └── zip 成 outputs/submissions/<TAG>/submission.zip
-    └── append outputs/submissions/ledger.jsonl
+    └── 写 benchmark/runs/<TAG>/test-output.json
+    └── zip 成 benchmark/runs/<TAG>/submission.zip（arcname='test-output.json'，无目录层）
+    └── append benchmark/ledger.jsonl
 
-Step 3: 本地自评 / Local sanity check
-  python eval.py --predictions outputs/submissions/<TAG>/test-output.json \
+Step 3: 本地自评 / Local sanity check（可选）
+  # 注意：test 没 ground truth，本地不能跑 eval.py 自评。
+  # 真正的本地预演是在 dev 上跑：
+  python -m scripts.run_inference --target dev --tag <TAG>_dev --decoding greedy
+  python eval.py --predictions outputs/predictions/<TAG>_dev__dev.json \
                  --groundtruth data/dev-claims.json
-    └── 注意：用 dev 自评只是 "schema 不报错" 校验，分数无意义（test 没标）
 
 Step 4: 上传 / Upload
-  浏览器 → Codabench → My Submissions → 选 phase → 上传 submission.zip
+  浏览器 → Codabench → My Submissions → 选 phase → 上传 benchmark/runs/<TAG>/submission.zip
 
 Step 5: 回填 / Backfill
-  把 leaderboard 实际跑分填进 ledger.jsonl 那一行的 score 字段
+  把 leaderboard 跑分填进 benchmark/ledger.jsonl 对应行的 codabench_hmean 字段
 ```
 
 ### 3.2 需要新增的两个脚本 / Two new scripts to add
@@ -150,7 +161,7 @@ Step 5: 回填 / Backfill
    - 每个 `evidences` 是 list 且非空；
    - 每个 evidence id 形如 `evidence-\d+` 且**真实存在于 `evidence.json`**（防止幻觉 ID）；
    - 每条 evidences 长度 ≤ 5（与训练时 top_k 对齐）。
-3. 写 `outputs/submissions/<TAG>/test-output.json`（UTF-8、`ensure_ascii=False`、`indent=2`）
+3. 写 `benchmark/runs/<TAG>/test-output.json`（UTF-8、`ensure_ascii=False`、`indent=2`）
 4. `zipfile.ZipFile(..., 'w', ZIP_DEFLATED)` 打包成 `submission.zip`
 5. 追加 ledger 行：`{ts, tag, phase, git_sha, preds_sha256, dev_holdout_hmean, codabench_hmean: null}`
 6. 校验 ledger 配额：phase=1 时今日 < 5 且累计 < 100；phase=2 时累计 < 3；超额拒绝。
@@ -205,13 +216,25 @@ Step 5: 回填 / Backfill
 
 ---
 
-## 6. 落地优先级 / Landing Priority
+## 6. 落地状态 / Landing Status
 
-1. **P0** — 给 `predict_all()` 打 `claim_text` 注入补丁（5 行）。Without this, every run produces a non-conforming preds file.
-2. **P0** — 写 `scripts/build_submission.py`（带完整性校验 + ledger），不带 ledger 也可先跑通打包。
-3. **P1** — 写 `scripts/run_inference.py`（如果当前推理逻辑只活在 notebook 里）。
-4. **P2** — ledger 加配额硬熔断；Phase 2 开始前手动 audit 一次 ledger。
-5. **P2** — 在 `tests/` 下加 `test_build_submission.py`：用 `outputs/dry_run/preds.json` 做端到端 smoke。
+| 项 / Item | 状态 / Status | 落点 / Where |
+|---|---|---|
+| `predict_all()` 注入 `claim_text` | ✅ 已落 | `src/inference.py:286-303`（debug_log #38） |
+| `scripts/build_submission.py`（完整性校验 + zip + ledger） | ✅ 已落 | commit `42603e6` + `5ced002` 重构进 `benchmark/` |
+| `scripts/run_inference.py`（端到端推理 CLI） | ✅ 已落 | commit `42603e6` |
+| `scripts/audit_cache.py`（缓存审计 CLI） | ✅ 已落 | commit `4a874a9`，AutoDL 自动检测 in `5ced002` |
+| `benchmark/` 自包含目录结构 + ledger 配额硬熔断 | ✅ 已落 | commit `5ced002`，见 `benchmark/README.md` |
+| **第一次 baseline 提交生成** | ✅ 已落 | `benchmark/runs/v1-base-rag-greedy/`（AutoDL, 2026-05-16） |
+| Codabench 上传 + 回填 ledger 的 `codabench_hmean` | ⏳ 待人工操作 | 需要把 zip 下载到本地 → Codabench → 拿到 H_FA 后回填 ledger |
+| 第二轮：retrieval 优化（chunking → reranker FT） | 🔜 进行中 | 见 task list；profile 脚本已写（`scripts/profile_evidence.py`），等 AutoDL 跑出 verdict |
 
-> 立即可做的最小切片 / Smallest first slice：把现成的 `outputs/dry_run/preds.json` 强行喂 build_submission（即便它只覆盖 dev+diag_test 而非 test），跑一遍把"打包→校验"链路在本地点亮，然后再去 Colab 跑真正的 test 推理。
-> Smallest first slice: feed the existing `outputs/dry_run/preds.json` into `build_submission.py` (even though it covers dev+diag_test, not test) just to light up the package-and-validate loop locally, **then** run real test inference on Colab.
+## 7. 接下来 / Next steps
+
+按优先级 / In priority order:
+
+1. **上传 v1 baseline 拿到 leaderboard 分数** —— 烧 1/100 配额，校准 dev→test 的 gap。如果 leaderboard H_FA 比 dev 上的 0.213 baseline 差很多，说明 dev/test 分布偏差大，需要重新调整策略。
+2. **跑 `scripts/profile_evidence.py`** —— 5 min 拿到 evidence 长度分布，决定 chunking 是不是值得做（如果 99% passage < 50 tokens，直接跳到第 4 项）
+3. **如果 chunking 值得 → 实现 `src/retrieval/chunking.py` + 重建索引 + dev 评估**（task #3-#5）
+4. **reranker fine-tune** —— 用 train+dev gold 作正样本，BM25+dense top-50 非 gold 作 hard negatives，LoRA SFT bge-reranker-base，对照"无 reranker / 原 reranker / FT 后" 三档
+5. **基于优化结果跑 v2 提交** —— TAG `v2-base-rag-<chunk-or-rerank>`，期望 H_FA > v1

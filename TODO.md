@@ -336,4 +336,26 @@ python -m scripts.build_indexes
 
 ---
 
-**下次 session 第一句话**：AutoDL 上 `source /etc/network_turbo && git pull && python -m src.build_stage0 --force && python -m scripts.run_sft 2>&1 | tee outputs/sft_v6_train.log`。重训 SFT v6（`pad_with_random=False`，~1.5h），训完 `swift export --merge_lora` 拿 merged_v6 → `phase1_eval --tracks 2,3 --sft-merged-dir <merged_v6>` → `diagnose_phase1`。看 Track 3 是否 HM > 0.213 (Track 2 baseline)；是 → 进 DPO；否 → 接受 Track 2 作 final report。
+**下次 session 第一句话**（**2026-05-16 更新 / 战略转 retrieval-first，不再做 SFT/DPO**）：
+
+```bash
+# AutoDL 端
+source /etc/network_turbo && cd /root/autodl-tmp/NLP-A3 && git pull origin main
+
+# 1. 跑 evidence profile（5 min，决定 chunking 是不是值得做）
+python -m scripts.profile_evidence
+head -50 outputs/evidence_profile.md   # 看 Verdict 段
+
+# 2a. verdict ∈ {"Strongly recommended", "Worth trying"} → 进 chunking 实验
+#     待实现：src/retrieval/chunking.py + scripts/build_indexes_chunked.py + scripts/eval_chunking.py
+# 2b. verdict ∈ {"Marginal", "Chunking unlikely to help"} → 跳到 reranker fine-tune
+#     bge-reranker-base LoRA on (claim, ev) pairs：train_split + dev_holdout gold 作正样本，
+#     当前 BM25+dense top-50 非 gold 作 hard negatives
+
+# 3. v1-base-rag-greedy 提交：本地从 AutoDL 下载下面这个文件 → Codabench 上传 → 拿到 H_FA → 回填 ledger
+ls -lh benchmark/runs/v1-base-rag-greedy/submission.zip
+```
+
+**为什么不再做 SFT/DPO**：debug_log #34/#36 + PROGRESS.md session 16 决策记录 — retrieval recall 才是真瓶颈，noisy retrieval 下 SFT 反而做 class collapse。剩余 ~6 天专注 retrieval 优化（chunk → reranker FT）。
+
+**当前 baseline**（已生成、待上传）：`v1-base-rag-greedy` (Qwen3.5-4B + BM25+dense + greedy + prompt v1, final_k=5, no rerank, no SFT)，dev_holdout HM 期望 ≈ 0.213（Track 2 v1 baseline 数字）。
