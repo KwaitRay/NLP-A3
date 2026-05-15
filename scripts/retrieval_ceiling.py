@@ -96,7 +96,7 @@ def _load_gold(dataset: str) -> dict[str, dict]:
     }
 
 
-def _build_components(use_rerank: bool):
+def _build_components(use_rerank: bool, reranker_path: str | None = None):
     """Load BM25, dense, reranker once. Returns (bm25, dense, reranker)."""
     from src.retrieval.bm25 import BM25Retriever
     from src.retrieval.dense import DenseRetriever
@@ -119,8 +119,10 @@ def _build_components(use_rerank: bool):
     reranker = None
     if use_rerank:
         try:
-            from src.retrieval.rerank import CrossEncoderReranker
-            reranker = CrossEncoderReranker()
+            from src.retrieval.rerank import CrossEncoderReranker, DEFAULT_RERANKER
+            model_name = reranker_path or DEFAULT_RERANKER
+            reranker = CrossEncoderReranker(model_name=model_name)
+            print(f"  reranker model: {model_name}")
         except Exception as e:
             print(f"  WARN: reranker load failed ({type(e).__name__}: {e}); audit without rerank")
     return bm25, dense, reranker
@@ -637,6 +639,12 @@ def main() -> None:
                    help=f"Comma-separated. Available: {','.join(MODE_RUNNERS)},all")
     p.add_argument("--no-rerank", action="store_true",
                    help="Skip cross-encoder rerank everywhere (cuts ~50%% runtime).")
+    p.add_argument("--reranker-path", default=None,
+                   help="Path / repo_id of the reranker model (default: "
+                        "BAAI/bge-reranker-base via models/bge-reranker-base). "
+                        "Pass a fine-tuned checkpoint (e.g. models/"
+                        "bge-reranker-base-ft/merged-seed-42) to run Gate B "
+                        "retrieval audit per reranker_finetune_plan.md §7.")
     args = p.parse_args()
 
     use_rerank = not args.no_rerank
@@ -650,9 +658,17 @@ def main() -> None:
                 raise SystemExit(f"unknown mode: {m}; available: {list(MODE_RUNNERS)} (or 'all')")
             modes.append(m)
 
+    # Suffix the output filename when a non-default reranker is used so
+    # baseline audit reports aren't clobbered (paralleling phase1_eval).
+    dataset_label = args.dataset
+    if use_rerank and args.reranker_path:
+        dataset_label = f"{dataset_label}_ftrer"
+
     print(f"=== Retrieval ceiling audit on {args.dataset} ===")
     print(f"  modes: {modes}")
     print(f"  rerank: {'on' if use_rerank else 'off'}")
+    if args.reranker_path:
+        print(f"  reranker path: {args.reranker_path}")
 
     print("\n[1/3] loading gold + evidence corpus...")
     gold = _load_gold(args.dataset)
@@ -660,7 +676,8 @@ def main() -> None:
     print(f"  {len(gold)} claims, {len(evidence):,} passages")
 
     print("\n[2/3] loading retrievers...")
-    bm25, dense, reranker = _build_components(use_rerank=use_rerank)
+    bm25, dense, reranker = _build_components(use_rerank=use_rerank,
+                                              reranker_path=args.reranker_path)
     print(f"  bm25={'on' if bm25 else 'off'}, dense={'on' if dense else 'off'}, "
           f"reranker={'on' if reranker else 'off'}")
 
@@ -671,7 +688,7 @@ def main() -> None:
         runner = MODE_RUNNERS[mode]
         all_rows[mode] = runner(gold, evidence, bm25, dense, reranker, use_rerank=use_rerank)
 
-    out_path = write_report(all_rows, args.dataset,
+    out_path = write_report(all_rows, dataset_label,
                             modes_ran=modes, used_rerank=use_rerank)
     print(f"\n=== Report written to {out_path} ===\n")
     print(out_path.read_text(encoding="utf-8").split("## Mode:", 1)[0])  # head only

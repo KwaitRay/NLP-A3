@@ -221,7 +221,8 @@ def write_summary(results: list[dict], dataset_label: str) -> Path:
 
 # -- Pipeline init ---------------------------------------------------------
 
-def build_pipeline(evidence: dict, *, final_k: int = 20, use_rerank: bool = False):
+def build_pipeline(evidence: dict, *, final_k: int = 20, use_rerank: bool = False,
+                   reranker_path: str | None = None):
     from src.retrieval.bm25 import BM25Retriever
     from src.retrieval.dense import DenseRetriever
     from src.retrieval.pipeline import RetrievalPipeline, RetrievalConfig
@@ -244,10 +245,13 @@ def build_pipeline(evidence: dict, *, final_k: int = 20, use_rerank: bool = Fals
             # Phase 3.5b audit (2026-05-12 PM) showed bge-reranker-base
             # hurts recall@5 on climate domain (-0.081, ×1.68 worse than
             # fused alone). Default is now use_rerank=False; pass
-            # --rerank to opt back in for ablation.
+            # --rerank to opt back in for ablation. --reranker-path points
+            # at a fine-tuned drop-in (see reranker_finetune_plan.md).
             try:
-                from src.retrieval.rerank import CrossEncoderReranker
-                reranker = CrossEncoderReranker()
+                from src.retrieval.rerank import CrossEncoderReranker, DEFAULT_RERANKER
+                model_name = reranker_path or DEFAULT_RERANKER
+                reranker = CrossEncoderReranker(model_name=model_name)
+                print(f"  reranker model: {model_name}")
             except Exception as e:
                 print(f"  WARN: reranker load failed ({type(e).__name__}: {e}); BM25+dense only")
     else:
@@ -350,6 +354,14 @@ def main():
                         "showed it cuts recall@5 by ~×1.68 on climate domain "
                         "(debug_log 复用经验 35). Use this flag only for "
                         "ablation; output filenames get a `_rerank` suffix.")
+    p.add_argument("--reranker-path", default=None,
+                   help="Path / repo_id of the reranker model. Only used when "
+                        "--rerank is set. Defaults to BAAI/bge-reranker-base "
+                        "(via models/bge-reranker-base). Pass a fine-tuned "
+                        "checkpoint (e.g. models/bge-reranker-base-ft/"
+                        "merged-seed-42) to run Gate B end-to-end eval per "
+                        "reranker_finetune_plan.md §7. Output filenames get "
+                        "a `_ftrer` suffix to preserve baselines.")
     args = p.parse_args()
 
     tracks = [int(x) for x in args.tracks.split(",")]
@@ -378,6 +390,11 @@ def main():
         dataset_label = f"{dataset_label}_k{args.final_k}"
     if args.rerank:
         dataset_label = f"{dataset_label}_rerank"
+    if args.reranker_path:
+        if not args.rerank:
+            print(f"  NOTE: --reranker-path set but --rerank not; flag ignored.")
+        else:
+            dataset_label = f"{dataset_label}_ftrer"
     print(f"=== Phase 1 eval: tracks={tracks} prompts={prompts} "
           f"dataset={args.dataset} final_k={args.final_k} ===")
     if dataset_label != args.dataset:
@@ -420,7 +437,8 @@ def main():
     if 2 in tracks or 3 in tracks:
         print("\n[3/4] loading evidence corpus + RAG pipeline...")
         evidence = load_evidence(show_progress=True)
-        pipeline = build_pipeline(evidence, final_k=args.final_k, use_rerank=args.rerank)
+        pipeline = build_pipeline(evidence, final_k=args.final_k, use_rerank=args.rerank,
+                                  reranker_path=args.reranker_path)
         print(f"  evidence: {len(evidence):,} passages")
         print(f"  RAG final_k = {args.final_k}, rerank = {args.rerank}")
 

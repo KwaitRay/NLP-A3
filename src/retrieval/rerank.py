@@ -27,10 +27,17 @@ class CrossEncoderReranker:
 
     def _load(self):
         if self._model is None:
+            from pathlib import Path as _Path
             from sentence_transformers import CrossEncoder
             from ..paths import resolve_model_path
-            # Prefer pre-downloaded local copy under models/<basename>/.
-            path = resolve_model_path(self.model_name)
+            # If model_name is itself a local directory (e.g. a fine-tuned
+            # checkpoint at models/bge-reranker-base-ft/merged-seed-42),
+            # load it directly. Otherwise fall back to repo_id resolution.
+            local = _Path(self.model_name)
+            if local.is_dir() and (local / "config.json").exists():
+                path = str(local)
+            else:
+                path = resolve_model_path(self.model_name)
             self._model = CrossEncoder(path, device=self.device, max_length=512)
         return self._model
 
