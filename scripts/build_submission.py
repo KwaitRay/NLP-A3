@@ -11,10 +11,10 @@ Pipeline (per BENCHMARK_SUBMISSION.md §3):
        - evidences is a non-empty list, len <= --max-evidences (default 5)
        - every evidence id matches r"^evidence-\\d+$"
        - every evidence id exists in evidence.json (skippable via flag)
-  4. Write outputs/submissions/<TAG>/test-output.json (UTF-8, indent=2).
-  5. Zip into outputs/submissions/<TAG>/submission.zip — single file at
+  4. Write benchmark/runs/<TAG>/test-output.json (UTF-8, indent=2).
+  5. Zip into benchmark/runs/<TAG>/submission.zip — single file at
      archive root, no directory layer.
-  6. Append outputs/submissions/ledger.jsonl with quota guards:
+  6. Append benchmark/ledger.jsonl with quota guards:
        - Phase 1: <5 today AEST, <100 ever-in-phase-1
        - Phase 2: <3 ever-in-phase-2
      Use --force to override (logged in the ledger row).
@@ -40,12 +40,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.data_io import load_test_unlabelled  # noqa: E402
-from src.paths import EVIDENCE_JSON, LABELS, OUTPUTS_DIR  # noqa: E402
+from src.paths import BENCHMARK_DIR, EVIDENCE_JSON, LABELS, OUTPUTS_DIR  # noqa: E402
 
 
-SUBMISSIONS_DIR = OUTPUTS_DIR / "submissions"
-LEDGER = SUBMISSIONS_DIR / "ledger.jsonl"
-EVIDENCE_ID_CACHE = SUBMISSIONS_DIR / ".evidence_ids.txt"
+# All Codabench artifacts live under benchmark/. Each run is self-contained
+# at benchmark/runs/<TAG>/ (preds.json + test-output.json + submission.zip +
+# config.json snapshot). Cross-run state — ledger + evidence-id cache —
+# sits at folder root so it's shared between runs.
+RUNS_DIR = BENCHMARK_DIR / "runs"
+LEDGER = BENCHMARK_DIR / "ledger.jsonl"
+EVIDENCE_ID_CACHE = BENCHMARK_DIR / ".evidence_ids.txt"
 EVIDENCE_ID_RE = re.compile(r"^evidence-\d+$")
 AEST = timezone(timedelta(hours=10))
 PHASE_DAILY_CAP = {1: 5, 2: None}
@@ -297,8 +301,13 @@ def _git_dirty() -> bool:
 def write_submission(
     merged: dict[str, dict], tag: str
 ) -> tuple[Path, Path, str]:
-    """Write test-output.json + submission.zip under outputs/submissions/<TAG>/."""
-    out_dir = SUBMISSIONS_DIR / tag
+    """Write test-output.json + submission.zip under benchmark/runs/<TAG>/.
+
+    Co-locates with preds.json (written by run_inference) and config.json
+    (snapshot of the run flags) so the entire submission is self-contained
+    in one folder, easy to migrate or audit independently.
+    """
+    out_dir = RUNS_DIR / tag
     out_dir.mkdir(parents=True, exist_ok=True)
     json_path = out_dir / "test-output.json"
     zip_path = out_dir / "submission.zip"
@@ -328,7 +337,7 @@ def main() -> int:
     p.add_argument("--max-evidences", type=int, default=5, help="reject any claim with more than this many evidences (default 5)")
     p.add_argument("--dev-hmean", type=float, default=None, help="optional: H_FA on dev_holdout for the same model, recorded in ledger")
     p.add_argument("--skip-evidence-check", action="store_true", help="don't validate evidence ids against evidence.json (use only when corpus unavailable)")
-    p.add_argument("--refresh-evidence-cache", action="store_true", help="rebuild outputs/submissions/.evidence_ids.txt from evidence.json")
+    p.add_argument("--refresh-evidence-cache", action="store_true", help="rebuild benchmark/.evidence_ids.txt from evidence.json")
     p.add_argument("--force", action="store_true", help="override quota refusal — logged as forced=true in ledger")
     args = p.parse_args()
 

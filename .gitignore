@@ -36,6 +36,12 @@ models/
 
 # Submission packaging
 *.zip
+# Codabench artifacts under benchmark/ — keep ledger.jsonl + each
+# runs/<TAG>/config.json tracked (small, reproducibility); ignore
+# the regen-able heavy stuff (preds.json, test-output.json, evidence-id cache)
+benchmark/.evidence_ids.txt
+benchmark/runs/*/preds.json
+benchmark/runs/*/test-output.json
 
 # Local env
 .env

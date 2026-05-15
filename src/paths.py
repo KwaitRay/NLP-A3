@@ -21,6 +21,10 @@ OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 # Keeping them outside outputs/ makes the gitignore + zip-strip rules cleaner
 # (outputs/ is for what the project produces; models/ is for what it consumes).
 MODELS_DIR = PROJECT_ROOT / "models"
+# Codabench leaderboard artifacts (preds + zips + ledger + evidence-id cache).
+# Lives at project root so every submission run is self-contained under
+# benchmark/runs/<TAG>/, easy to audit/migrate independently of outputs/.
+BENCHMARK_DIR = PROJECT_ROOT / "benchmark"
 
 TRAIN_CLAIMS = DATA_DIR / "train-claims.json"
 DEV_CLAIMS = DATA_DIR / "dev-claims.json"

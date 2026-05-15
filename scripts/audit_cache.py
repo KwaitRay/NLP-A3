@@ -37,23 +37,32 @@ from typing import Literal
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.paths import (  # noqa: E402
-    DATA_DIR, EVIDENCE_JSON, MODELS_DIR, OUTPUTS_DIR, PROJECT_ROOT,
+    BENCHMARK_DIR, DATA_DIR, EVIDENCE_JSON, MODELS_DIR, OUTPUTS_DIR, PROJECT_ROOT,
     SFT_DIR, SPLITS_DIR, TRAIN_CLAIMS, TEST_CLAIMS_UNLABELLED,
 )
 
 
 Tier = Literal["critical", "important", "helpful", "report"]
 
+AUTODL_CACHE = Path("/root/autodl-tmp/nlp_a3_cache")
+
 
 def _cache_root() -> Path:
-    """Where AutoDL puts SFT/DPO checkpoints — env-driven, falls back to outputs/.
+    """Where AutoDL puts SFT/DPO checkpoints — env-driven with platform fallback.
 
-    AutoDL notebook cell [4] sets CACHE_ROOT=/root/autodl-tmp/nlp_a3_cache.
-    Colab + local set CACHE_ROOT=$PROJECT_ROOT/outputs. Honor whatever the
-    notebook env established; fall back to outputs/ when unset.
+    Resolution order (matches notebook cell [4] convention):
+      1. $CACHE_ROOT env var (set by notebook setup or by user)
+      2. AutoDL auto-detect: /root/autodl-tmp/nlp_a3_cache/ exists → use it
+         (so a fresh shell on AutoDL doesn't need `export CACHE_ROOT=...`
+          before running this script — see debug_log #37 lesson)
+      3. Default: outputs/ (Colab + local)
     """
     env = os.environ.get("CACHE_ROOT")
-    return Path(env) if env else OUTPUTS_DIR
+    if env:
+        return Path(env)
+    if AUTODL_CACHE.exists() and "google.colab" not in sys.modules:
+        return AUTODL_CACHE
+    return OUTPUTS_DIR
 
 
 CACHE_ROOT = _cache_root()
@@ -111,7 +120,7 @@ CHECKS: list[Entry] = [
           "notebook cell 1.3 (run_splits) — deterministic from train", "diag_test eval, SFT data"),
     Entry("SFT training data",     "helpful", SFT_DIR / "sft_train_v1.jsonl",
           "notebook cell 1.4 (build_sft_dataset)", "SFT/DPO training (cell 2.5/2.6)"),
-    Entry("evidence-id cache",     "helpful", OUTPUTS_DIR / "submissions" / ".evidence_ids.txt",
+    Entry("evidence-id cache",     "helpful", BENCHMARK_DIR / ".evidence_ids.txt",
           "auto-builds on first build_submission run", "fast evidence-id corpus check (~1s vs ~30s)"),
     Entry("bge-reranker-base",     "helpful", MODELS_DIR / "bge-reranker-base" / "config.json",
           "python -m scripts.download_models", "ablation only — DEFAULT OFF (#35: hurts climate recall@5 ×1.68)"),
@@ -119,7 +128,7 @@ CHECKS: list[Entry] = [
     # -- report: run history --------------------------------------------
     Entry("Phase 1 eval reports",  "report", OUTPUTS_DIR / "eval_phase1",
           "python -m scripts.phase1_eval --tracks 1,2 --prompts v1", "ablation tables for the report"),
-    Entry("submission ledger",     "report", OUTPUTS_DIR / "submissions" / "ledger.jsonl",
+    Entry("submission ledger",     "report", BENCHMARK_DIR / "ledger.jsonl",
           "auto-appends on every build_submission run", "Phase 1/2 quota tracking — must migrate cross-machine"),
 ]
 

@@ -23,8 +23,9 @@ Run::
         --decoding retrieval-only
 
 Output::
-    outputs/predictions/<tag>__<target>.json
-        — same schema as build_submission expects (claim_text injected).
+    target=test  → benchmark/runs/<tag>/preds.json   (+ config.json snapshot)
+    other        → outputs/predictions/<tag>__<target>.json
+    Same schema either way; build_submission consumes the test variant.
 """
 from __future__ import annotations
 
@@ -48,7 +49,7 @@ from src.inference import (  # noqa: E402
     ZeroShotInferer,
     predict_all,
 )
-from src.paths import LABELS, MODELS_DIR, OUTPUTS_DIR, SPLITS_DIR  # noqa: E402
+from src.paths import BENCHMARK_DIR, LABELS, MODELS_DIR, OUTPUTS_DIR, SPLITS_DIR  # noqa: E402
 
 # Reuse phase1_eval's loaders so all submission-time inference picks up the
 # same cache lookup + quantisation as the ablation runs.
@@ -58,7 +59,11 @@ from scripts.phase1_eval import (  # noqa: E402
 )
 
 
+# General inference outputs (dev / diag_test / etc.) → outputs/predictions/.
+# Test-set inference (Codabench-bound) goes under benchmark/runs/<tag>/ so it
+# co-locates with the submission.zip + ledger row that build_submission writes.
 PRED_DIR = OUTPUTS_DIR / "predictions"
+RUNS_DIR = BENCHMARK_DIR / "runs"
 
 
 # ---- pretty printing -------------------------------------------------------
@@ -224,7 +229,8 @@ def main() -> int:
     p.add_argument("--limit", type=int, default=None,
                    help="cap claims for quick smoke (e.g. --limit 30).")
     p.add_argument("--out", default=None, type=Path,
-                   help="output path; default outputs/predictions/<tag>__<target>.json")
+                   help="output path. Default: benchmark/runs/<tag>/preds.json (target=test) "
+                        "or outputs/predictions/<tag>__<target>.json (other targets).")
     args = p.parse_args()
 
     if args.sft_adapter and args.sft_merged_dir:
@@ -299,8 +305,31 @@ def main() -> int:
         label_strategy=args.label_strategy,
     )
 
-    out_path = args.out or (PRED_DIR / f"{args.tag}__{args.target}.json")
+    # Default output location:
+    #   - target=test  → benchmark/runs/<tag>/preds.json (Codabench-bound,
+    #     co-locates with the submission.zip build_submission will write)
+    #   - other targets → outputs/predictions/<tag>__<target>.json
+    if args.out is not None:
+        out_path = args.out
+    elif args.target == "test":
+        out_path = RUNS_DIR / args.tag / "preds.json"
+    else:
+        out_path = PRED_DIR / f"{args.tag}__{args.target}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # For test runs, snapshot the run config alongside preds so the
+    # submission folder is self-describing — anyone reading benchmark/runs/<tag>/
+    # later can see exactly which flags produced these predictions, plus the
+    # git SHA they were produced at.
+    if args.target == "test":
+        config_snapshot = {
+            **{k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
+            "git_sha": _read_git_sha(),
+        }
+        (out_path.parent / "config.json").write_text(
+            json.dumps(config_snapshot, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     # predict_all needs {cid: {"claim_text": ..., ...}} — load_target already
     # returns that shape. It also injects claim_text into every output record
@@ -322,6 +351,21 @@ def main() -> int:
         print(f"next: python eval.py --predictions {out_path.relative_to(OUTPUTS_DIR.parent)} \\")
         print(f"          --groundtruth data/dev-claims.json")
     return 0
+
+
+def _read_git_sha() -> str | None:
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(OUTPUTS_DIR.parent),
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0:
+            return out.stdout.strip()
+    except Exception:
+        pass
+    return None
 
 
 if __name__ == "__main__":
