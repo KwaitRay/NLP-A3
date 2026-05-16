@@ -433,3 +433,67 @@ python -m scripts.phase1_eval --tracks 2 --prompts v1 --dataset dev_holdout \
 - `outputs/evidence_profile.md`（待生成）—— Profile 产出 + verdict
 - `src/retrieval/{bm25,dense,pipeline}.py` —— 现有 retrieval stack 接口
 - `debug_log.md` 复用经验 39 —— reranker 失败的 task mismatch 诊断（chunking 不在此根因下，是不同 lever）
+
+---
+
+## 13. Results / 实验结果（2026-05-16 完结，未执行）
+
+> Profile-first gate (§2) 直接拦截：`scripts.profile_evidence` 报告 verdict
+> **"Chunking unlikely to help"**。本 plan 的 §3-§11 全部跳过未执行。
+>
+> Profile-first gate aborted execution. Verdict is "Chunking unlikely
+> to help"; §3-§11 skipped. Plan retained as design-only ablation.
+
+### 13.1 Profile 实测 / Empirical profile
+
+`outputs/evidence_profile.md`（2026-05-16, 4080 SUPER, bge-m3 tokenizer, 全 corpus 扫描 126s）：
+
+| 统计 / Stat | 实测 / Value | 阈值 / Threshold | 判定 |
+|---|---|---|---|
+| Corpus size | 1,208,827 | - | - |
+| Median tokens | 26 | < 100 → "Unlikely" criterion | **触发** |
+| p95 tokens | 58 | - | - |
+| p99 tokens | 80 | - | - |
+| Max tokens | 809 | - | 长尾 41 + 2 条 |
+| **% over 256 tokens** | **0.00% (43/1.2M)** | < 1% AND short median → "Unlikely" | **触发** |
+| % over 512 tokens | 0.00% (2 条) | - | - |
+| Sentences per passage (p90) | 1 | - | 已是单句原子粒度 |
+
+→ verdict: **"Chunking unlikely to help. >99% of passages fit in a single 256-token encoding window, and median is short."**
+
+### 13.2 为什么 chunking 不适用本 corpus / Why chunking is moot
+
+Plan §1 的前提（bge-m3 在长段落上 silently truncate → dense 漏召回）**不成立**：
+
+- bge-m3 `max_seq_length=256`，corpus p99=80 tokens —— 编码器永远不会截断
+- reranker max_length=512，corpus p99=80 —— 也不会截断
+- 90% 段落 ≤50 tokens，**段落本身已经是单句**（climate Wikipedia 风格 + 短新闻片段）
+
+**Corpus 已被数据集作者切到原子粒度**。`scripts/profile_evidence.py` 的 verdict 逻辑正确捕获了这点 → 自动 abort，没让我们浪费 4h dense rebuild。
+
+### 13.3 这告诉我们什么 / What this implies
+
+Retrieval @20 = 0.360 的瓶颈**不是结构性 truncation**。剩下可能原因（按本项目已 audit 状态标注）：
+
+| 可能原因 | 状态 |
+|---|---|
+| Encoder truncation | ❌ 排除（本 plan）|
+| 词面/语义匹配不足 | ❌ HyDE/sub-claim 已试，只对 @50/@100 有效（debug_log #36） |
+| Reranker 错误重排 | ❌ Reranker FT × 3 + v2-m3 zero-shot 全失败（plan §15）|
+| Gold 标注不全 | 未审计（dataset-side 问题，无法本地解）|
+| Embedder 本身不够强 | bge-m3 zero-shot 已经是当前 best；换 embedder 要 3-4h 重建 1.2M 索引，预期 marginal |
+| Query 跟 evidence 跨域（claim style vs Wikipedia style）| Plan §15.4 未走的路：FEVER-trained NLI reranker 可能解，但 6 天 deadline 内不做 |
+
+**结论**：**retrieval-side 4 条主 lever 全部用尽**（HyDE / reranker FT / reranker swap / chunking），HM ceiling = 0.213 (Track 2 v1 baseline) 是工程现实。**剩余时间转 Phase 6 终评 + 报告**。
+
+### 13.4 报告价值 / Why this matters for the report
+
+这是另一个 valuable negative result。chunking 是经典 retrieval 优化 lever；我们用 profile-first 设计 + 5min 评估直接判定 "本任务不适用"，没浪费 GPU。值得在 Discussion 写：
+
+- **Corpus pre-chunking observation**：数据集作者已选择单句粒度，retrieval 算法层面无再优化空间
+- **Profile-first methodology**：花 5 min 决定 4h 实验要不要跑的元决策框架，比"先跑再说"省 GPU
+
+### 13.5 决策落点 / Decision landed
+
+**Chunking route aborted before execution 2026-05-16 PM**。Plan 留作 design-only ablation，§13 记录 verdict-based abort 过程。下一步是 **Phase 6 终评 + 报告**，不再尝试 retrieval 优化。
+
