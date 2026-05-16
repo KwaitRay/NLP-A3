@@ -1949,6 +1949,66 @@ InfoNCE 让 model 把 pos 顶到 negs 之上的唯一办法 = 学到「fact-chec
 
 详细 ablation log：`reranker_finetune_plan.md` §15 Results；audit 报告：`outputs/eval_phase1/retrieval_ceiling_diag_test_ftrer.md`（v2-m3）+ 训练 log `outputs/reranker_train_seed42_v{1,2,3}.log`。
 
+### 40. final_k=20 + greedy → LLM 在 NEI/DISPUTED 上 over-cite（44/153 claims > 5 evidences），submission 卡 max_evidences=5
+
+**触发**（2026-05-16 Phase 6 跑 test 提交时撞）：
+
+```
+$ python -m scripts.run_inference --target test --tag v2-locked-greedy \
+    --decoding greedy --final-k 20
+  [done] 153 predictions written
+
+$ python -m scripts.build_submission --preds .../preds.json --tag ... --phase 1
+  [fail] validation failed:
+  - claim-1009: 20 evidences > cap 5
+  - claim-1048: 6 evidences > cap 5
+  - claim-109: 20 evidences > cap 5
+  …and 41 more  (total 44/153 over cap)
+```
+
+**根因**：`src/prompt.py` v1 prompt **没有显式 cap 引用数量**——只说 "list the evidence numbers you relied on, in the form `##[1,3]##`"。当 `final_k=20` 给 LLM 20 个候选时：
+
+- **claim 是 SUPPORTS/REFUTES 且证据明确**：LLM cite 1-3 条，正常
+- **claim 是 NEI 或主题模糊**：LLM 没有"我不知道"概念（§0.5.2 4a 同根），倾向于 cite 全部 20 → "万一答案在里面呢" 心智
+
+实测分布（v2-locked-greedy preds.json on test, 153 claims）：
+
+| 引用数 | claim 数 | 占比 |
+|---|---|---|
+| 1-3 | 大多数 | 主流 SUPPORTS/REFUTES |
+| 4-5 | 中等 | 略复杂 |
+| 6-10 | ~10 条 | mild over-cite |
+| **20** | ~10 条 | full-list dump，几乎全是 NEI/DISPUTED claims |
+
+**为什么 `final_k=5` 时不会撞**：那时 LLM 最多只能引用 1-5（候选总共就 5），自然不会超 cap。`final_k=20` 解锁了 over-cite 行为，但这不是 final_k 的问题——是 prompt 的 cap 漏了。
+
+**两种解法**（择一）：
+
+| 方案 | 改动 | 副作用 |
+|---|---|---|
+| A. Prompt 加 "Cite at most 5 evidences" | `src/prompt.py` v1 | 重测 HM；可能掉一些 recall（模型不敢 cite 6-7 时 cap 卡得早） |
+| **B. Submission 端 truncate**（采用）| `scripts/build_submission.py` 加 `--truncate-to-max` flag | 不重测；保留 phase1_eval 的 HM 数字一致性；truncate 到 LLM 引用顺序的前 5（≈ 检索 rank 顺序） |
+
+**选 B 的理由**：
+
+1. **解耦 evaluation 和 submission**：phase1_eval 的 HM 0.213 是用 full evidence list 算的，submission 切到 5 不改变 eval 数字（leaderboard 自己评，跟我们 dev HM 解耦）
+2. **不改 prompt 不重测**：少烧 1 次 GPU + 不动 §0.5.3 的 prompt 决策日志
+3. **Truncate 到前 5 = 保留最高置信引用**：LLM 写 `##[1,5,12,17,20]##` 时数字顺序通常贴近"我最相信的在前"；保留前 5 = 损失最小
+4. **可被 leaderboard 验证**：truncate 后 precision 上升（5 个 candidate 里命中 gold 概率高于 20 里命中），HM 期望 +0.01-0.03
+
+**实现**（commit `<TBD>`）：
+
+`validate_and_merge()` 加 `truncate_to_max: bool = False` 参数；触发时不 reject，把 `evs = list(evs)[:max_evidences]` + warn 一行 "truncated N claim(s) to top-K"。CLI flag `--truncate-to-max` opt-in（不自动启用，避免静默改 ground truth）。
+
+**复用要点**：
+
+1. **inference output ≠ submission output**：两者的 schema cap 可以不同。Inference 保留 full（eval 一致），submission 应用 leaderboard rule（cap=5）。**不要在 inference 阶段就硬切**，会让 phase1_eval 数字跟 leaderboard 提交对不上。
+2. **build_submission 该有的两条出口**：reject (default, 严格) + truncate (opt-in, 务实)。先 reject 让人看到行为异常，再 opt-in truncate 解决。
+3. **LLM citation 数量 vs final_k 不是 1:1**：模型在 NEI/不确定时倾向「保险 dump」。监测 distribution 比假设它 cite K=2-3 更稳。
+4. **`##[..]##` parser 信任 LLM 数字顺序作为 confidence 顺序**：LLM 通常按"最相信→最不相信"排数字，所以前 K 优先保留是好的截断策略。
+5. **想根治 over-cite 要改 prompt + 重测全部**：成本高、风险也高（prompt 改了 NEI/DISPUTED 检出率可能变）。除非 leaderboard 提交反馈数字明显比 dev 差，否则 `--truncate-to-max` 是终态。
+6. **eval 时不 truncate 但 submit 时 truncate** = phase1_eval 数字偏保守，leaderboard 数字偏乐观。预期 leaderboard HM > dev HM 0.213（precision 上升），但**不一定单调**——如果某些 claim 的 gold 在 cite 列表的位置 5+，truncate 会丢一条 hit。
+
 
 
 

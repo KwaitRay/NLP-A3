@@ -117,14 +117,22 @@ def validate_and_merge(
     evidence_ids: set[str] | None,
     *,
     max_evidences: int,
+    truncate_to_max: bool = False,
 ) -> dict[str, dict]:
     """Return a fresh dict with claim_text merged in and schema enforced.
 
     Raises ValueError listing every problem found (so a single run surfaces
     everything wrong, not just the first claim that breaks).
+
+    When `truncate_to_max=True`, claims with > max_evidences citations get
+    truncated to the first `max_evidences` instead of rejected. Citation
+    order = LLM's `##[i,j,k]##` order ≈ retrieval rank, so first-k keeps
+    the highest-confidence picks. Useful when final_k > 5 and the LLM
+    sometimes over-cites; see debug_log #40 (2026-05-16).
     """
     errors: list[str] = []
     warnings: list[str] = []
+    truncated_count = 0
     out: dict[str, dict] = {}
 
     expected = set(test_claims.keys())
@@ -152,8 +160,12 @@ def validate_and_merge(
             errors.append(f"{cid}: evidences must be a non-empty list, got {evs!r}")
             continue
         if len(evs) > max_evidences:
-            errors.append(f"{cid}: {len(evs)} evidences > cap {max_evidences}")
-            continue
+            if truncate_to_max:
+                evs = list(evs)[:max_evidences]
+                truncated_count += 1
+            else:
+                errors.append(f"{cid}: {len(evs)} evidences > cap {max_evidences}")
+                continue
 
         bad_format = [e for e in evs if not (isinstance(e, str) and EVIDENCE_ID_RE.match(e))]
         if bad_format:
@@ -182,6 +194,9 @@ def validate_and_merge(
         more = f"\n  …and {len(errors) - 20} more" if len(errors) > 20 else ""
         raise ValueError("validation failed:\n  - " + "\n  - ".join(head) + more)
 
+    if truncated_count:
+        _warn(f"truncated {truncated_count} claim(s) to top-{max_evidences} evidences "
+              f"(first-k by LLM citation order, ≈ retrieval rank)")
     _ok(f"validated {len(out)}/{len(expected)} claims, no schema errors")
     return out
 
@@ -334,7 +349,12 @@ def main() -> int:
     p.add_argument("--preds", required=True, type=Path, help="path to predictions JSON")
     p.add_argument("--tag", required=True, help="short identifier for this submission (used in folder name + ledger)")
     p.add_argument("--phase", required=True, type=int, choices=[1, 2], help="Codabench phase (1=Ongoing, 2=Final)")
-    p.add_argument("--max-evidences", type=int, default=5, help="reject any claim with more than this many evidences (default 5)")
+    p.add_argument("--max-evidences", type=int, default=5, help="cap any claim at this many evidences (default 5, matches leaderboard precision sweet spot)")
+    p.add_argument("--truncate-to-max", action="store_true",
+                   help="instead of rejecting claims with > --max-evidences citations, "
+                        "truncate to the first N (≈ retrieval-rank order). Use when "
+                        "final_k > 5 and the LLM over-cites on uncertain claims "
+                        "(common with NEI/DISPUTED). See debug_log #40.")
     p.add_argument("--dev-hmean", type=float, default=None, help="optional: H_FA on dev_holdout for the same model, recorded in ledger")
     p.add_argument("--skip-evidence-check", action="store_true", help="don't validate evidence ids against evidence.json (use only when corpus unavailable)")
     p.add_argument("--refresh-evidence-cache", action="store_true", help="rebuild benchmark/.evidence_ids.txt from evidence.json")
@@ -367,7 +387,8 @@ def main() -> int:
     # 3. Validate + merge.
     try:
         merged = validate_and_merge(
-            preds, test_claims, evidence_ids, max_evidences=args.max_evidences
+            preds, test_claims, evidence_ids, max_evidences=args.max_evidences,
+            truncate_to_max=args.truncate_to_max
         )
     except ValueError as e:
         _fail(str(e))
