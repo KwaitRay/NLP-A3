@@ -1884,6 +1884,73 @@ preds[cid] = {"claim_text": ctext, **result}
 4. 本项目所有 inferer (`ModelInferer` / `ZeroShotInferer` / `RetrievalOnlyInferer` / `NoRagInferer`) 输出 dict **不需要**自己加 `claim_text`，由 `predict_all` 统一注入——如果以后加新 inferer，**别在 inferer 内部加 claim_text 字段**（重复注入）
 5. **第一次提交配额很贵**（Phase 1 是 5/天，Phase 2 是 1/3 终生），先在 dev 上跑 build_submission 走一遍打包链路（`--dry-run` 等价方式：跑 dev 但 phase 选 1，让平台拒收）→ 烧掉一次也能学到"我的链路是不是对的"
 
+### 39. Reranker FT × 3 + v2-m3 zero-shot 全失败 — retrieval-relevance vs fact-checking 任务 mismatch
+
+**实验链路**（2026-05-16，时间序）：
+
+| Run | 配置 | Best r@20 | 失败模式 |
+|---|---|---|---|
+| FT v1 | lr 2e-5, smoothing 0.05, n_negs 7, 3 ep | 0.338 @ step 200 | step 200 后回吐到 0.288 / 0.258 |
+| FT v2 | lr 5e-6, smoothing 0.15, n_negs 3, 3 ep | 0.326 @ step 500 | LR cosine 衰到 ~0 才停，未饱和 |
+| FT v3 | lr 1e-5, smoothing 0.10, n_negs 5, **8 ep** | 0.325 @ step 200 | step 200 是 peak，之后**灾难性遗忘**（step 700 跌到 0.157）|
+| v2-m3 zero-shot | bge-reranker-v2-m3 568M, 0 FT | **0.306** | 比 base zero-shot (0.333) 还**差** |
+| **fused (no rerank) baseline** | - | **0.360** | - |
+
+**3 次 FT 在 r@20 ≈ 0.32-0.34 撞墙**（v1 0.338 / v2 0.326 / v3 0.325），best ckpt 都在前 500 step 出现，超参不解，更大模型 zero-shot 也不解。
+
+**根因诊断**（这是关键 insight）：
+
+bge-reranker-base / v2-m3 / Qwen3-Reranker 全是 **MS-MARCO retrieval-relevance** pre-train。它们学到的 signal 是「query 跟 passage 在主题/语义上有多相关」。但 fact-checking 的 (claim, gold-evidence) 关系是**逻辑蕴含**（entailment）—— 一段证据「支持/反驳」一条 claim，跟「跟 claim 相关」不是一回事。
+
+具体到我们的训练数据：
+
+- **Positives**：claim 的 gold evidence（标注员判定的支持/反驳证据）
+- **Hard negs**：BM25+dense fused top-50 里非 gold 的段落（即检索相似度最高的非 gold）
+
+这两类段落**在 retrieval similarity 维度上几乎不可区分** —— 都是 top-50 里气候/科学相关的句子。pre-trained reranker 用 retrieval signal 看，两类一样高分。
+
+InfoNCE 让 model 把 pos 顶到 negs 之上的唯一办法 = 学到「fact-checking entailment」signal。但：
+- 模型容量小（278M / 568M backbone）
+- 训练数据小（986 claims × ~2 gold ev = ~2070 train rows）
+- 数据有 noise（gold 标注不全，hard negs 里有 entailment-equivalent passage）
+
+→ InfoNCE 找不到稳定 signal，**最优策略是把 pos/neg 都打成均匀分布**（loss → ln(N)）→ uniform random scoring → recall ≈ 把 fused 原顺序保留。这就是 v2 跑出来的「比 base 不差但也不好」中间态。
+
+更深训练（v3 8 ep）则进一步：模型用 LoRA capacity 拟合训练集 noise → 把 pre-trained 通用语义理解给吃掉 → **灾难性遗忘** → recall 跌穿 base zero-shot 一倍。
+
+**v2-m3 zero-shot 反而比 base 差**（r@20 0.306 vs 0.333）的原因：v2-m3 是更大、更自信的 retrieval reranker。它把 retrieval similarity 当成更强的 signal，更激进地把「主题最相关」段落顶到 top-5。但对 fact-checking 来说，**真正的 gold 经常不是「主题最相关」的那条**（它是「逻辑上支持/反驳」的那条），所以 v2-m3 越自信 = 越错。在 r@5 上 v2-m3 (0.146) 略好于 base (0.119)，但 @10/@20 全输。
+
+**信号 vs 容量 / capacity vs signal**：
+
+| 假设 | 检验方式 | 结论 |
+|---|---|---|
+| 容量不够 → 换更大模型 | bge-v2-m3 (568M) zero-shot | **证伪**（r@20 0.306 ≤ base 0.333）|
+| 训练数据 noise → 调超参 | FT × 3 (lr / smoothing / n_negs / epochs 都改) | **证伪**（3 次都撞 0.32-0.34）|
+| 训练数据少 → 更多样本 | （未试）| 不会试，986 是项目硬约束 |
+| **任务 mismatch → 换 task-aligned backbone** | NLI/FEVER pre-trained reranker（如 `cross-encoder/nli-deberta-v3-base`）| **没试**，6 天 deadline 转其他 lever |
+
+**为什么 Qwen3-Reranker 不值得试**：Qwen3-Reranker-0.6B/4B/8B 也是 retrieval-relevance pre-train（指令模板 + LM head 输出 yes/no logit 衡量 query-doc 相关性）。**同根任务 mismatch**，集成成本 ~1h 但失败概率与 v2-m3 同根。
+
+**真正可能解开的路径**（未来工作）：
+
+1. **NLI/FEVER pre-trained reranker**：`cross-encoder/nli-deberta-v3-base` (440M) 在 MNLI+FEVER+ANLI 上训，输出 entailment 概率。FEVER 本身就是 fact-checking 任务，期望 zero-shot 就强于 retrieval reranker。
+2. **重新构造 hard negs**：从 corpus **远离 top-50** 处采（rank 100+ 或 random），引入「明显不相关」的容易负样本，给 InfoNCE 一个可学习的边界。但 cleaner negs 也会让训练信号变弱（"too easy"）—— 真正干净的 negs 通常无信息量。
+3. **数据规模**：迁移 FEVER train (~140k claims) 预训练 reranker，再在 climate 上 LoRA fine-tune。但 FEVER train 数据本身就有 noise/domain gap。
+
+**复用要点**：
+
+1. **InfoNCE loss 收敛到 ln(N)** = uniform random scoring = 模型没找到可学习的判别 signal。**这是数据/任务 mismatch 的指纹**，不是「再调超参」能修的。
+2. **Reranker FT 看 r@k 不看 train loss**：v3 train loss 下到 1.4（看起来「学到了」）但 eval r@20 是越训越烂。任何「loss 下降 ≠ 真在学」的训练任务，验证集必须从 step 0 开始打点。
+3. **「换更大模型」不解 task mismatch**：bge-v2-m3 vs base，capacity ×2 但 r@20 反而 −0.027。更大的预训练模型把错误任务做得更自信而已。
+4. **Pre-trained reranker 在 OOD 任务上 zero-shot 经常是负贡献**：bge-reranker-base 在 climate 上 r@5 0.119 < no-rerank 0.200。**默认开 reranker 是反模式**；新数据集上必须 audit 后再决定。
+5. **Hard-neg 必须匹配 inference 分布**（D-019 同 lesson）：我们的 hard negs 来自 `fused (no rerank) top-50`——和推理 reranker 看到的同一分布。这个对，否则 train/inference mismatch 会让 FT 更糟。但**匹配分布 ≠ 信号足够**，分布对 + 信号差 = 撞墙。
+6. **Catastrophic forgetting 的 LoRA 也会塌**：以为 LoRA 只调 0.7% 参数所以「不会忘」是错觉。`modules_to_save=["classifier"]` 让 head 全量更新；attention LoRA 也能间接改变 base 行为。v3 step 700 比 step 0 还烂证明了这点。
+7. **任务对齐 > 模型容量**：对小数据 OOD 任务，440M NLI/FEVER reranker > 8B retrieval reranker 的概率比直觉高。但这不是这周能做的实验。
+
+详细 ablation log：`reranker_finetune_plan.md` §15 Results；audit 报告：`outputs/eval_phase1/retrieval_ceiling_diag_test_ftrer.md`（v2-m3）+ 训练 log `outputs/reranker_train_seed42_v{1,2,3}.log`。
+
+
+
 
 
 

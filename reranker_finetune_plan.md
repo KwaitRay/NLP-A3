@@ -508,3 +508,75 @@ peeks per D-006. Skip entirely if §7.4 fails.
 - [ ] 10. [if Gate B pass] dev_holdout final check → Gate C
 - [ ] 11. 写决策日志到 `optimization_plan.md` §10 + `debug_log.md` 新一条复用经验
 - [ ] 12. [if Gate C pass and recall@20 ≥ 0.45] 重建 SFT v6 + 重训 → 进 §12
+
+---
+
+## 15. Results / 实验结果（2026-05-16 完结）
+
+> **本节是 Plan 的 post-mortem**。原 plan §7.4 三档判定（success / partial / failure）实测落到 **failure** 档。本节记录 4 次实验数据、失败模式诊断、为什么连「换更大 backbone」也救不了，以及为什么放弃这条路转 chunking。
+>
+> Final outcome: **all 4 experiments failed Gate A** (r@20 ≥ 0.40). Reranker FT route abandoned 2026-05-16 PM. Documented as ablation evidence for report. Detailed root-cause analysis: `debug_log.md` 复用经验 39.
+
+### 15.1 实验汇总 / Experiment summary
+
+| Run | Date | Config | Best r@20 | Best step | Failure mode |
+|---|---|---|---|---|---|
+| FT v1 (fp16) | 05-16 AM | lr 2e-5, smoothing 0.05, n_negs 7, 3 ep, **fp16** | n/a (NaN) | n/a | step 20 起 loss=NaN，AdamW 中毒，eval 三个 ckpt 字节级相同（NaN sort 保留 input 顺序）|
+| FT v1 (bf16) | 05-16 AM | 同上 + **bf16** | **0.338** | 200 | step 200 后回吐到 0.258；loss 从 4 → 2 (= ln(8))；模型从 anti-correlated 训到 uniform random 就停了 |
+| FT v2 | 05-16 PM | lr 5e-6, smoothing 0.15, n_negs 3, 3 ep | **0.326** | 500 | 低 LR + cosine schedule 让模型衰到 LR≈0 也没饱和；学习曲线健康但太慢 |
+| FT v3 | 05-16 PM | lr 1e-5, smoothing 0.10, n_negs 5, **8 ep** | **0.325** | 200 | **灾难性遗忘**：step 200 peak 后单调崩盘到 step 700 r@20=0.157（低于 base zero-shot 一倍）；train loss 下到 1.4 = 拟合 noise + 吃掉 pre-trained 语义 |
+| v2-m3 zero-shot | 05-16 PM | `bge-reranker-v2-m3` 568M, no FT | **0.306** | n/a | 比 base zero-shot (0.333) 还差；r@5 略好于 base (0.146 vs 0.119) 但 @10/@20 全输 |
+| **baseline** (fused, no rerank) | - | - | **0.360** | - | - |
+| Gate A 门槛 | - | - | **0.40** | - | - |
+
+**3 次 FT 全在 r@20 ≈ 0.32-0.34 撞墙**。任何超参组合都到不了 baseline。
+
+### 15.2 失败模式 / Failure modes
+
+**两个表征**：
+
+1. **InfoNCE loss 收敛到 ln(N) = ln(8) ≈ 2.08** —— uniform random scoring 的理论最优。模型在「打平所有 candidate」时 loss 最低；说明它找不到能区分 pos/neg 的稳定 signal。
+2. **Eval recall 在前 500 step 达到 peak，之后越训越烂** —— 不是经典 overfitting (train acc 涨 eval 跌)，是**灾难性遗忘**：LoRA capacity 用来拟合训练集 noise + classifier head 更新把 pre-trained 通用语义吃掉。
+
+**为什么 v2-m3 zero-shot 反而比 base 差**：v2-m3 是更大、更自信的 retrieval reranker。它把 retrieval similarity 当成更强的 signal，更激进地把「主题最相关」段落顶到 top-5。但对 fact-checking 来说，**真正的 gold 经常不是「主题最相关」的那条**（它是「逻辑上支持/反驳」的那条），所以 v2-m3 越自信 = 越错。
+
+### 15.3 根因 / Root cause
+
+**任务 mismatch (retrieval relevance vs fact-checking entailment)**：
+
+- bge-reranker-base / v2-m3 / Qwen3-Reranker 全是 **MS-MARCO retrieval-relevance** pre-train。学的 signal 是「query 跟 passage 主题相关度」。
+- 我们的 (claim, gold-evidence) 关系是**逻辑蕴含**（entailment）—— 「这段证据支持/反驳这条 claim」，跟「跟 claim 相关」不是一回事。
+- Hard negs (fused top-50 非 gold) 跟 pos (gold) 在 retrieval similarity 上**几乎不可区分**。pre-trained reranker 看它们都是高分，无法判别。
+- InfoNCE 让 model 把 pos 顶到 negs 之上的唯一办法 = 学到 entailment signal。但容量 (278M / 568M) + 数据 (986 claims) + 标注 noise 三因素叠加，无法学到稳定 signal。
+
+**容量假设的证伪**（关键决策证据）：
+
+| 假设 | 检验 | 结果 |
+|---|---|---|
+| 容量不够 → 换大模型 | bge-v2-m3 (568M) zero-shot | **证伪**（r@20 0.306 ≤ base 0.333）|
+| 数据 noise → 调超参 | FT × 3，lr / smoothing / epochs / n_negs 都改过 | **证伪**（3 次都撞 0.32-0.34）|
+
+**为什么不试 Qwen3-Reranker 系列**：Qwen3-Reranker-0.6B/4B/8B 也是 retrieval-relevance pre-train（指令 + LM head 输出 yes/no logit 衡量 query-doc 相关性）。**同根任务 mismatch**，集成成本 ~1h，失败概率与 v2-m3 同根 → 不试。
+
+### 15.4 未走的路 / Paths not taken
+
+如果有更多时间，下一步会试：
+
+1. **NLI/FEVER pre-trained reranker** — `cross-encoder/nli-deberta-v3-base` (440M) 在 MNLI+FEVER+ANLI 上训，输出 entailment 概率。FEVER 本身是 fact-checking 任务，**期望 zero-shot 就强于 retrieval reranker**。集成成本 ~1h（不同 head + score 转换）。
+2. **远距离 hard negs** — 从 corpus rank 100+ 或 random 采负样本，引入「明显不相关」的容易负，给 InfoNCE 一个可学边界。但 cleaner negs 通常无信息量，trade-off 不一定划算。
+3. **FEVER 预训练 + climate fine-tune** — 迁移 FEVER train (~140k claims) 预训练 reranker，再 LoRA fine-tune。但 FEVER train 本身有 noise/domain gap，工程量大。
+
+### 15.5 报告价值 / Why this matters for the report
+
+这是一个**完整 ablation chain**，对报告 Discussion 段有 narrative 价值：
+
+- **3 个递进超参实验** (v1/v2/v3) 证伪「调超参可救」
+- **1 个 zero-shot 对照** (v2-m3) 证伪「换大模型可救」
+- **根因诊断坐实** task mismatch 是结构性问题
+
+对应 design.md §11.3 "What didn't work" 表格的 1 个核心 entry。和 SFT v2/v3 class-collapse (D-019)、HyDE/sub-claim only-deep (debug_log #36) 一起，构成 3-failure-stories narrative。
+
+### 15.6 决策落点 / Decision landed
+
+**Reranker FT route abandoned 2026-05-16 PM**。下一个 lever 是 **evidence chunking**（`scripts/profile_evidence.py` 已就绪，先看 verdict 决定 chunking 是否值得做）。Reranker default 保持 `use_rerank=False`（Phase 3.5b 锁定），所有 FT artifact 留在 `models/bge-reranker-base-ft/` 作 ablation 证据。
+
