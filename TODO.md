@@ -336,26 +336,40 @@ python -m scripts.build_indexes
 
 ---
 
-**下次 session 第一句话**（**2026-05-16 更新 / 战略转 retrieval-first，不再做 SFT/DPO**）：
+**下次 session 第一句话**（**2026-05-16 PM 更新 / retrieval 4 levers 全失败，转 Phase 6 终评**）：
 
 ```bash
 # AutoDL 端
 source /etc/network_turbo && cd /root/autodl-tmp/NLP-A3 && git pull origin main
 
-# 1. 跑 evidence profile（5 min，决定 chunking 是不是值得做）
-python -m scripts.profile_evidence
-head -50 outputs/evidence_profile.md   # 看 Verdict 段
+# === Phase 6 (Step 1): 官方 dev 终评，吃 D-006 配额最后 1 次 (~8 min) ===
+python -m scripts.phase1_eval --tracks 2 --prompts v1 --dataset official_dev \
+    2>&1 | tee outputs/eval_phase1_official_dev.log
+head -20 outputs/eval_phase1/track2_v1_official_dev.md   # 看 HM (期望 ≈ 0.21)
 
-# 2a. verdict ∈ {"Strongly recommended", "Worth trying"} → 进 chunking 实验
-#     待实现：src/retrieval/chunking.py + scripts/build_indexes_chunked.py + scripts/eval_chunking.py
-# 2b. verdict ∈ {"Marginal", "Chunking unlikely to help"} → 跳到 reranker fine-tune
-#     bge-reranker-base LoRA on (claim, ev) pairs：train_split + dev_holdout gold 作正样本，
-#     当前 BM25+dense top-50 非 gold 作 hard negatives
+# === Phase 6 (Step 2): 构建 v2-locked-greedy 提交（locked config: final_k=20, no rerank, prompt v1）===
+# 注意：final_k=20 时 LLM 在 NEI/DISPUTED 上会 over-cite (44/153 引用 > 5)，
+# build_submission 必须加 --truncate-to-max（debug_log #40）。
+python -m scripts.run_inference --target test --tag v2-locked-greedy \
+    --decoding greedy --prompt-version v1 --final-k 20
 
-# 3. v1-base-rag-greedy 提交：本地从 AutoDL 下载下面这个文件 → Codabench 上传 → 拿到 H_FA → 回填 ledger
-ls -lh benchmark/runs/v1-base-rag-greedy/submission.zip
+python -m scripts.build_submission \
+    --preds benchmark/runs/v2-locked-greedy/preds.json \
+    --tag v2-locked-greedy --phase 1 --truncate-to-max
+
+ls -lh benchmark/runs/v2-locked-greedy/submission.zip
+
+# === Phase 6 (Step 3): 本地下载 zip → Codabench 上传 → 回填 ledger ===
 ```
 
-**为什么不再做 SFT/DPO**：debug_log #34/#36 + PROGRESS.md session 16 决策记录 — retrieval recall 才是真瓶颈，noisy retrieval 下 SFT 反而做 class collapse。剩余 ~6 天专注 retrieval 优化（chunk → reranker FT）。
+**为什么 retrieval-side 4 levers 全失败**：
+- HyDE/sub-claim: only @50/@100, not @20（debug_log #36）
+- Reranker FT × 3: task mismatch retrieval vs fact-checking（plan §15, debug_log #39）
+- bge-reranker-v2-m3 zero-shot: 同根任务 mismatch，r@20=0.306 比 base 0.333 还差
+- Chunking: corpus 已被原作者切到单句原子粒度，median 26 tokens（chunking_plan §13）
 
-**当前 baseline**（已生成、待上传）：`v1-base-rag-greedy` (Qwen3.5-4B + BM25+dense + greedy + prompt v1, final_k=5, no rerank, no SFT)，dev_holdout HM 期望 ≈ 0.213（Track 2 v1 baseline 数字）。
+Lock Track 2 v1 (HM 0.213) 为 final 配置。剩 ~6 天专注 Phase 6 (official_dev + test + report)。详见 `BENCHMARK_SUBMISSION.md` §6-§7 状态。
+
+**当前 baseline**：
+- `v1-base-rag-greedy`（已生成、待上传）—— Qwen3.5-4B + BM25+dense + greedy + prompt v1, **final_k=5**, no rerank, no SFT。早期保守版。
+- `v2-locked-greedy`（构建中）—— 同上但 **final_k=20** = Phase 3.5 锁定的生产配置。**diag_test HM 0.213**（Track 2 v1 baseline）。`build_submission --truncate-to-max` 处理 over-cite（44/153 条 cite > 5，详 debug_log #40）。期望 leaderboard H_FA ≥ v1（precision 上升）。

@@ -11,11 +11,12 @@
 
 ## 0. TL;DR
 
-> **当前状态 / Current status (as of 2026-05-16)**
+> **当前状态 / Current status (as of 2026-05-16 PM)**
 > - 提交流水线**已落地**：`scripts/run_inference.py` + `scripts/build_submission.py` + `benchmark/` 自包含目录
 > - 第一个 baseline 已生成：`v1-base-rag-greedy`（Qwen3.5-4B + BM25+dense + greedy + prompt v1, final_k=5），AutoDL 上 153 条推理用时 ~6 min
+> - **第二个 baseline 进行中**：`v2-locked-greedy`（同上但 **final_k=20** = locked Phase 3.5 config, dev HM 0.213）。需要 `build_submission --truncate-to-max` 处理 over-cite（debug_log #40）。
 > - 提交配额追踪已上线：`benchmark/ledger.jsonl`（1/100 used）
-> - SFT/DPO **暂时跳过** —— `debug_log.md` #34/#36 已经证明 retrieval ceiling 才是瓶颈，noisy retrieval 下 SFT 反而做 class collapse。当前优化方向：retrieval-first（chunking → reranker FT）
+> - **优化路线已收尾**：reranker FT × 3 + bge-v2-m3 zero-shot + chunking 全部失败（详见 `reranker_finetune_plan.md` §15 + `chunking_plan.md` §13 + debug_log #39）。retrieval-side 4 levers 走完，**lock Track 2 v1 (HM 0.213) 为 final 配置**，转 Phase 6 终评 + 报告。
 
 - **平台**：Codabench leaderboard，2026 学期可选项（不计入最终成绩，仅作公共对比）。
   **Platform**: Codabench leaderboard for COMP90042 2026 — *optional*, does not affect final mark, used purely as a public benchmark.
@@ -120,17 +121,23 @@ outputs/dry_run/preds.json          # 当前命名 ≠ test-output.json
 Step 1: 推理 / Inference (default --out goes to benchmark/runs/<TAG>/preds.json
         when --target test; other targets go to outputs/predictions/)
   python -m scripts.run_inference --target test --tag <TAG> \
-      --decoding greedy --prompt-version v1 --final-k 5
+      --decoding greedy --prompt-version v1 --final-k 20
     └── 在 AutoDL 上跑 inferer over test-claims-unlabelled (153 claims)
     └── 落盘 benchmark/runs/<TAG>/preds.json (claim_text 已注入)
     └── 同时落盘 benchmark/runs/<TAG>/config.json (run flags + git SHA snapshot)
+    └── ⚠️ final_k=20 是 Phase 3.5 锁定的生产配置（dev HM 0.213）。LLM 在
+        NEI/DISPUTED 上会 over-cite (~28%/153 条引用 > 5)，但这不阻塞 —
+        Step 2 加 --truncate-to-max 解决。详见 debug_log #40。
 
 Step 2: 打包 / Build submission
   python -m scripts.build_submission \
       --preds benchmark/runs/<TAG>/preds.json \
-      --tag <TAG> --phase 1
+      --tag <TAG> --phase 1 --truncate-to-max
     └── 合并 claim_text（从 test-claims-unlabelled.json 重 merge，防 stale preds）
     └── 校验 153 个 claim_id 全在、label 合法、evidences 非空、evidence_id ∈ evidence.json
+    └── --truncate-to-max：claim 引用 > 5 时切到前 5（≈ retrieval rank 顺序），
+        而不是 reject 整个 submission。decouple eval (full list) 跟 submit
+        (cap 5)；保留 phase1_eval HM 数字可比性。
     └── 写 benchmark/runs/<TAG>/test-output.json
     └── zip 成 benchmark/runs/<TAG>/submission.zip（arcname='test-output.json'，无目录层）
     └── append benchmark/ledger.jsonl
@@ -195,7 +202,7 @@ Step 5: 回填 / Backfill
 - [ ] `claim_label` 在 4 类白名单内
 - [ ] `evidences` 是非空 list，每个元素是 `evidence-\d+` 形态
 - [ ] 抽查 ≥ 5 个 evidence id 真实存在于 `evidence.json`
-- [ ] `len(evidences) ≤ 5` per claim（与设计一致，避免 precision 被稀释）
+- [ ] `len(evidences) ≤ 5` per claim（与设计一致，避免 precision 被稀释）—— 若 final_k > 5 致 over-cite，用 `build_submission --truncate-to-max` 自动切到前 5
 - [ ] `test-output.json` 单文件 zip，zip 内**没有目录层级**（解压即得文件，不是 `<TAG>/test-output.json`）
 - [ ] 文件用 UTF-8（`file -bi` 或 PowerShell `Get-Content -Encoding UTF8`）
 - [ ] ledger 校验当日 / 当 phase 配额未超
@@ -225,16 +232,17 @@ Step 5: 回填 / Backfill
 | `scripts/run_inference.py`（端到端推理 CLI） | ✅ 已落 | commit `42603e6` |
 | `scripts/audit_cache.py`（缓存审计 CLI） | ✅ 已落 | commit `4a874a9`，AutoDL 自动检测 in `5ced002` |
 | `benchmark/` 自包含目录结构 + ledger 配额硬熔断 | ✅ 已落 | commit `5ced002`，见 `benchmark/README.md` |
-| **第一次 baseline 提交生成** | ✅ 已落 | `benchmark/runs/v1-base-rag-greedy/`（AutoDL, 2026-05-16） |
+| **第一次 baseline 提交生成** | ✅ 已落 | `benchmark/runs/v1-base-rag-greedy/`（AutoDL, 2026-05-16, final_k=5） |
+| **第二次 baseline (locked config)** | 🔄 in progress | `benchmark/runs/v2-locked-greedy/`（final_k=20, no rerank, prompt v1）—— dev HM 0.213，需 `build_submission --truncate-to-max` 处理 over-cite |
+| `build_submission --truncate-to-max` flag | ✅ 已落 | commit `85ee2b4`，解 final_k=20 下 LLM over-cite（debug_log #40） |
 | Codabench 上传 + 回填 ledger 的 `codabench_hmean` | ⏳ 待人工操作 | 需要把 zip 下载到本地 → Codabench → 拿到 H_FA 后回填 ledger |
-| 第二轮：retrieval 优化（chunking → reranker FT） | 🔜 进行中 | 见 task list；profile 脚本已写（`scripts/profile_evidence.py`），等 AutoDL 跑出 verdict |
+| 第二轮：retrieval 优化（chunking + reranker FT + bge-v2-m3） | ❌ 全部失败 | `reranker_finetune_plan.md` §15 + `chunking_plan.md` §13 + debug_log #39。retrieval 4 levers 走完，确认 task mismatch / corpus 已原子化 |
 
-## 7. 接下来 / Next steps
+## 7. 接下来 / Next steps（2026-05-16 PM 更新）
 
-按优先级 / In priority order:
+retrieval-side 4 levers 全失败，Phase 6 收尾。按优先级：
 
-1. **上传 v1 baseline 拿到 leaderboard 分数** —— 烧 1/100 配额，校准 dev→test 的 gap。如果 leaderboard H_FA 比 dev 上的 0.213 baseline 差很多，说明 dev/test 分布偏差大，需要重新调整策略。
-2. **跑 `scripts/profile_evidence.py`** —— 5 min 拿到 evidence 长度分布，决定 chunking 是不是值得做（如果 99% passage < 50 tokens，直接跳到第 4 项）
-3. **如果 chunking 值得 → 实现 `src/retrieval/chunking.py` + 重建索引 + dev 评估**（task #3-#5）
-4. **reranker fine-tune** —— 用 train+dev gold 作正样本，BM25+dense top-50 非 gold 作 hard negatives，LoRA SFT bge-reranker-base，对照"无 reranker / 原 reranker / FT 后" 三档
-5. **基于优化结果跑 v2 提交** —— TAG `v2-base-rag-<chunk-or-rerank>`，期望 H_FA > v1
+1. **`v2-locked-greedy` 提交**（进行中）—— final_k=20 locked config + `--truncate-to-max`，期望 H_FA > v1（因为 dev HM 0.213 比 v1 final_k=5 高，且 truncate 把过度 cite 切到 top-5 → precision 上升）
+2. **官方 dev 终评**（吃 D-006 配额最后 1 次）—— `phase1_eval --tracks 2 --prompts v1 --dataset official_dev`，校准 dev/test gap
+3. **Phase 6 报告写作** —— design.md §11.3 6-9 张图 + 3 failure stories narrative (SFT D-019 + reranker #39 + chunking moot)。优化路线已收尾，重心转报告。
+4. ~~chunking / reranker FT~~ —— 已确认无效，留 ablation evidence，不再尝试。
