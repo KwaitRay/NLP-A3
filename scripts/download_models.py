@@ -91,6 +91,17 @@ MODELS: dict[str, dict[str, str]] = {
         "size":   "~1 GB",
         "purpose": "Cross-encoder reranker",
     },
+    "bge-reranker-v2-m3": {
+        "folder": "bge-reranker-v2-m3",
+        "ms_id":  "BAAI/bge-reranker-v2-m3",
+        "hf_id":  "BAAI/bge-reranker-v2-m3",
+        "size":   "~2 GB",
+        "purpose": "Stronger cross-encoder reranker (568M, multilingual). "
+                   "Drop-in for bge-reranker-base via --reranker-path. "
+                   "Tried as Gate A alternative after bge-reranker-base FT "
+                   "failed (2026-05-16): same sentence-transformers API but "
+                   "larger backbone may overcome MS-MARCO/climate task gap.",
+    },
     "bge-small-en-v1.5": {
         "folder": "bge-small-en-v1.5",
         "ms_id":  "Xorbits/bge-small-en-v1.5",
